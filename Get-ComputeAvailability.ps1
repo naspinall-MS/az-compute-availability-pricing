@@ -43,17 +43,26 @@
 
 .PARAMETER Region
     One or more ARM region names (e.g. australiaeast, northeurope, eastus).
+    Optional when -RegionCsv is supplied; inline values and CSV values are
+    combined.
+
+.PARAMETER RegionCsv
+    Path to a CSV file listing ARM region names to include. Values may be
+    comma-separated on one line, one per line, or a mix, with or without a
+    header row (a leading Region/Location/Name header is ignored). Values are
+    merged with any inline -Region values and de-duplicated. At least one
+    region (inline or CSV) is required.
 
 .PARAMETER VmSize
     One or more ARM SKU names (e.g. Standard_D2s_v5, Standard_E4s_v5). Optional
     when -VmSizeCsv is supplied; inline values and CSV values are combined.
 
 .PARAMETER VmSizeCsv
-    Path to a CSV file listing VM SKU names to include. The script reads the
-    first matching column named (case-insensitive) VmSize, SKU, Size, or Name;
-    if none match, the first column is used. Values are merged with any inline
-    -VmSize values and de-duplicated. At least one VM size (inline or CSV) is
-    required.
+    Path to a CSV file listing VM SKU names to include. Values may be
+    comma-separated on one line, one per line, or a mix, with or without a
+    header row (a leading VmSize/SKU/Size/Name header is ignored). Values are
+    merged with any inline -VmSize values and de-duplicated. At least one VM
+    size (inline or CSV) is required.
 
 .PARAMETER IncludeSpot
     Include Spot pricing in the output. Spot is highly variable; the API returns
@@ -102,11 +111,20 @@
     region and reused.
 
 .PARAMETER SubscriptionCsv
-    Path to a CSV file listing subscription names or IDs to evaluate. The script
-    reads the first matching column named (case-insensitive) Subscription,
-    SubscriptionId, SubscriptionName, Id, or Name; if none match, the first
-    column is used. Values are merged with any inline -Subscription values and
-    de-duplicated.
+    Path to a CSV file listing subscription names or IDs to evaluate. Values may
+    be comma-separated on one line, one per line, or a mix, with or without a
+    header row (a leading Subscription/SubscriptionId/SubscriptionName/Id/Name
+    header is ignored). Values are merged with any inline -Subscription values
+    and de-duplicated.
+
+.PARAMETER Currency
+    ISO currency code for pricing (e.g. USD, EUR, GBP, AUD). Passed to the Azure
+    Retail Prices API. Default USD. All monetary columns are expressed in this
+    currency.
+
+.PARAMETER PassThru
+    Emit the result rows as objects to the pipeline (in addition to the console
+    table) so they can be filtered, sorted, or exported by the caller.
 
 .PARAMETER ThrottleLimit
     Max parallel region queries. Default 5.
@@ -118,15 +136,19 @@
     .\Get-ComputeAvailability.ps1 -Region eastus -VmSize Standard_E8s_v5 -IncludeSpot -OutputCsv .\vm-prices.csv
 
 .EXAMPLE
-    .\Get-ComputeAvailability.ps1 -Region eastus,westus2 -VmSizeCsv .\skus.csv -SubscriptionCsv .\subs.csv
+    .\Get-ComputeAvailability.ps1 -RegionCsv .\regions.csv -VmSizeCsv .\skus.csv -SubscriptionCsv .\subs.csv
+
+.EXAMPLE
+    .\Get-ComputeAvailability.ps1 -Region westeurope -VmSize Standard_D2s_v5 -Currency EUR -PassThru |
+        Where-Object RI_3Yr_Save_Pct -gt 40 | Sort-Object RI_3Yr_PerMonth
 #>
 #Requires -Version 7.0
 [CmdletBinding()]
 param(
     [string[]]$VmSize        = @(),
-    [Parameter(Mandatory)]
-    [string[]]$Region,
+    [string[]]$Region        = @(),
     [string]$VmSizeCsv       = '',
+    [string]$RegionCsv       = '',
     [switch]$IncludeSpot,
     [switch]$IncludeWindows,
     [ValidateRange(1, [int]::MaxValue)]
@@ -135,7 +157,10 @@ param(
     [double]$ACD             = 0,
     [ValidateRange(1, [int]::MaxValue)]
     [int]$InstanceCount      = 1,
+    [ValidatePattern('^[A-Za-z]{3}$')]
+    [string]$Currency        = 'USD',
     [string]$OutputCsv       = '',
+    [switch]$PassThru,
     [switch]$SkipAvailability,
     [switch]$SkipPricing,
     [string[]]$Subscription  = @(),
@@ -146,6 +171,8 @@ param(
 
 Set-StrictMode -Version 1
 
+$Currency = $Currency.ToUpperInvariant()
+
 if ($SkipAvailability -and $SkipPricing) {
     throw 'Cannot specify both -SkipAvailability and -SkipPricing; at least one data source is required.'
 }
@@ -153,46 +180,48 @@ if ($SkipAvailability -and $SkipPricing) {
 # ----- CSV-sourced VM sizes / subscriptions --------------------------------
 # Read SKU names and/or subscription identifiers from CSV files and merge them
 # with any inline -VmSize / -Subscription values. Values are trimmed, blanks
-# dropped, and duplicates removed. A named column is preferred (case-insensitive)
-# but the first column is used as a fallback for simple single-column files.
+# dropped, and duplicates removed. Any layout is accepted: values may be
+# comma-separated on one line, one per line, or a mix, with or without a header
+# row. Tokens matching a known header name (case-insensitive) are discarded.
 function Import-CsvValues {
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string[]]$Column
+        [Parameter(Mandatory)][string[]]$Header
     )
     if (-not (Test-Path -LiteralPath $Path)) {
         throw "CSV file not found: $Path"
     }
-    $rows = @(Import-Csv -LiteralPath $Path)
-    if ($rows.Count -eq 0) {
-        Write-Warning "CSV file has no data rows: $Path"
-        return @()
-    }
-    $props   = @($rows[0].PSObject.Properties.Name)
-    $colName = $null
-    foreach ($cand in $Column) {
-        $match = $props | Where-Object { $_ -ieq $cand } | Select-Object -First 1
-        if ($match) { $colName = $match; break }
-    }
-    if (-not $colName) { $colName = $props | Select-Object -First 1 }
-
-    return @($rows |
-        ForEach-Object { "$($_.$colName)".Trim() } |
-        Where-Object { $_ -ne '' } |
+    $headerSet = [System.Collections.Generic.HashSet[string]]::new(
+        [string[]]$Header, [System.StringComparer]::OrdinalIgnoreCase)
+    $tokens = [System.IO.File]::ReadAllText($Path) -split '[,\r\n]+'
+    $values = @($tokens |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -ne '' -and -not $headerSet.Contains($_) } |
         Select-Object -Unique)
+    if ($values.Count -eq 0) {
+        Write-Warning "No values found in CSV file: $Path"
+    }
+    return $values
 }
 
 if ($VmSizeCsv) {
-    $csvSkus = Import-CsvValues -Path $VmSizeCsv -Column @('VmSize','SKU','Size','Name')
+    $csvSkus = Import-CsvValues -Path $VmSizeCsv -Header @('VmSize','SKU','Size','Name')
     $VmSize  = @($VmSize + $csvSkus | Where-Object { $_ } | Select-Object -Unique)
 }
+if ($RegionCsv) {
+    $csvRegions = Import-CsvValues -Path $RegionCsv -Header @('Region','Location','Name')
+    $Region     = @($Region + $csvRegions | Where-Object { $_ } | Select-Object -Unique)
+}
 if ($SubscriptionCsv) {
-    $csvSubs      = Import-CsvValues -Path $SubscriptionCsv -Column @('Subscription','SubscriptionId','SubscriptionName','Id','Name')
+    $csvSubs      = Import-CsvValues -Path $SubscriptionCsv -Header @('Subscription','SubscriptionId','SubscriptionName','Id','Name')
     $Subscription = @($Subscription + $csvSubs | Where-Object { $_ } | Select-Object -Unique)
 }
 
 if ($VmSize.Count -eq 0) {
     throw 'No VM sizes specified. Provide -VmSize and/or -VmSizeCsv.'
+}
+if ($Region.Count -eq 0) {
+    throw 'No regions specified. Provide -Region and/or -RegionCsv.'
 }
 
 Write-Host ''
@@ -200,35 +229,42 @@ Write-Host '================================================================' -F
 Write-Host '  Azure Virtual Machine Availability + Price Comparison' -ForegroundColor Cyan
 Write-Host "  Regions        : $($Region -join ', ')" -ForegroundColor Cyan
 Write-Host "  VM Sizes       : $($VmSize -join ', ')" -ForegroundColor Cyan
-Write-Host "  Spot           : $(if ($IncludeSpot) { 'included' } else { 'excluded' })" -ForegroundColor Cyan
-Write-Host "  WindowsLicense : $(if ($IncludeWindows) { 'included (license bundled)' } else { 'excluded' })" -ForegroundColor Cyan
+if ($Subscription -and -not $SkipAvailability) { Write-Host "  Subscriptions  : $($Subscription -join ', ')" -ForegroundColor Cyan }
+# Spot / license / hours / discount / instance options only affect pricing output,
+# and the licensing NOTE with them; hide the whole group when pricing is skipped.
+if (-not $SkipPricing) {
+    Write-Host "  Spot           : $(if ($IncludeSpot) { 'included' } else { 'excluded' })" -ForegroundColor Cyan
+    Write-Host "  WindowsLicense : $(if ($IncludeWindows) { 'included (license bundled)' } else { 'excluded' })" -ForegroundColor Cyan
+    Write-Host "  Hours/Mo       : $HoursPerMonth" -ForegroundColor Cyan
+    Write-Host "  Currency       : $Currency" -ForegroundColor Cyan
+    if ($ACD -gt 0) { Write-Host "  ACD            : -$ACD% applied to PAYGO" -ForegroundColor Cyan }
+    if ($InstanceCount -gt 1) { Write-Host "  Instances      : x$InstanceCount" -ForegroundColor Cyan }
+    Write-Host '' -ForegroundColor Cyan
+    if ($IncludeWindows) {
+        Write-Host '  NOTE: Windows rows bundle the Windows Server license premium.' -ForegroundColor Yellow
+        Write-Host '        RIs and Savings Plans do NOT discount the OS license portion -' -ForegroundColor Yellow
+        Write-Host '        only the underlying compute. SQL / other ISV licenses excluded.' -ForegroundColor Yellow
+        Write-Host '        Azure Hybrid Benefit (AHB) users: ignore Windows rows and use Linux.' -ForegroundColor Yellow
+    } else {
+        Write-Host '  NOTE: Prices do NOT include Windows / SQL / other OS license costs.' -ForegroundColor Yellow
+        Write-Host '        Reservations and Savings Plans only discount the compute portion.' -ForegroundColor Yellow
+        Write-Host '        Use -IncludeWindows to add Windows-licensed pricing rows.' -ForegroundColor Yellow
+    }
+}
+# Run-mode status is unrelated to the pricing inputs above; keep it at the bottom.
 if ($SkipPricing)      { Write-Host '  Pricing        : skipped (availability-only)' -ForegroundColor Cyan }
 if ($SkipAvailability) { Write-Host '  Availability   : skipped (pricing-only)' -ForegroundColor Cyan }
-if ($Subscription) { Write-Host "  Subscriptions  : $($Subscription -join ', ')" -ForegroundColor Cyan }
-Write-Host "  Hours/Mo       : $HoursPerMonth" -ForegroundColor Cyan
-if ($ACD -gt 0) { Write-Host "  ACD            : -$ACD% applied to PAYGO" -ForegroundColor Cyan }
-if ($InstanceCount -gt 1) { Write-Host "  Instances      : x$InstanceCount" -ForegroundColor Cyan }
-Write-Host '' -ForegroundColor Cyan
-if ($IncludeWindows) {
-    Write-Host '  NOTE: Windows rows bundle the Windows Server license premium.' -ForegroundColor Yellow
-    Write-Host '        RIs and Savings Plans do NOT discount the OS license portion -' -ForegroundColor Yellow
-    Write-Host '        only the underlying compute. SQL / other ISV licenses excluded.' -ForegroundColor Yellow
-    Write-Host '        Azure Hybrid Benefit (AHB) users: ignore Windows rows and use Linux.' -ForegroundColor Yellow
-} else {
-    Write-Host '  NOTE: Prices do NOT include Windows / SQL / other OS license costs.' -ForegroundColor Yellow
-    Write-Host '        Reservations and Savings Plans only discount the compute portion.' -ForegroundColor Yellow
-    Write-Host '        Use -IncludeWindows to add Windows-licensed pricing rows.' -ForegroundColor Yellow
-}
 Write-Host '================================================================' -ForegroundColor Cyan
 Write-Host ''
 
 $rows = [System.Collections.Concurrent.ConcurrentBag[pscustomobject]]::new()
 
 function Format-Price {
-    # All values here are monthly USD; show 2 decimal places. $null -> 'N/A'.
+    # All values here are monthly amounts in the selected currency; show 2
+    # decimals with thousands separators. $null -> 'N/A'.
     param([object]$Value)
     if ($null -eq $Value) { return 'N/A' }
-    return ([double]$Value).ToString('F2')
+    return ([double]$Value).ToString('N2')
 }
 
 function Format-Pct {
@@ -244,6 +280,11 @@ function Format-Pct {
 #   - Else use current Az context (or a single empty placeholder if Az is
 #     unavailable, so the script still produces pricing-only rows)
 # Each emitted row carries SubscriptionName/Id so multi-sub diffs are visible.
+#
+# Availability is the ONLY subscription-scoped data. When -SkipAvailability is
+# set, pricing is identical across subscriptions, so any -Subscription input is
+# ignored and we collapse to a single subscription (current context, or a
+# placeholder) to avoid emitting duplicate pricing rows.
 $subs = [System.Collections.Generic.List[hashtable]]::new()
 $azAvailable = $false
 try {
@@ -251,7 +292,11 @@ try {
     $azAvailable = $true
 } catch { }
 
-if ($Subscription.Count -gt 0) {
+if ($SkipAvailability -and $Subscription.Count -gt 0) {
+    Write-Warning "-Subscription is ignored with -SkipAvailability (subscription scope only affects availability); pricing is identical across subscriptions, so a single row set is produced."
+}
+
+if ($Subscription.Count -gt 0 -and -not $SkipAvailability) {
     if (-not $azAvailable) {
         Write-Warning "-Subscription specified but Az module not available. Install Az.Accounts and Connect-AzAccount."
     } else {
@@ -344,7 +389,7 @@ if (-not $SkipAvailability) {
         })
 
         if ($workItems.Count -gt 0) {
-            Write-Host "  Availability lookup ($($workItems.Count) sub/region pair(s), parallel)..." -ForegroundColor DarkCyan
+            Write-Progress -Activity 'SKU availability lookup' -Status "$($workItems.Count) subscription/region pair(s)..."
             $availResults = [System.Collections.Concurrent.ConcurrentBag[hashtable]]::new()
             $vmSizeSet    = [System.Collections.Generic.HashSet[string]]::new(
                 [string[]]$VmSize, [System.StringComparer]::OrdinalIgnoreCase)
@@ -414,6 +459,7 @@ if (-not $SkipAvailability) {
                     Reason         = $entry.Reason
                 }
             }
+            Write-Progress -Activity 'SKU availability lookup' -Completed
         }
         $availAvailable = $true
     } catch {
@@ -471,8 +517,8 @@ if ($azAvailable -and ($subs[0].Id -ne '')) {
     }
 }
 
-Write-Host ''
 # ---------------------------------------------------------------------------
+Write-Progress -Activity 'Querying regions' -Status "$($Region.Count) region(s)..."
 
 $Region | ForEach-Object -Parallel {
     $region       = $_
@@ -487,12 +533,13 @@ $Region | ForEach-Object -Parallel {
     $availOn      = $using:availAvailable
     $subs         = $using:subs
     $rowsBag      = $using:rows
+    $currency     = $using:Currency
 
     function Invoke-PricingPages {
         param([string]$Filter)
         # api-version=2023-01-01-preview is required to surface the `savingsPlan`
         # array on Consumption records. Without it, SP rates are not returned.
-        $uri   = "https://prices.azure.com/api/retail/prices?api-version=2023-01-01-preview&`$filter=$([Uri]::EscapeDataString($Filter))"
+        $uri   = "https://prices.azure.com/api/retail/prices?api-version=2023-01-01-preview&currencyCode=$currency&`$filter=$([Uri]::EscapeDataString($Filter))"
         $items = [System.Collections.Generic.List[object]]::new()
         do {
             $page = Invoke-RestMethod -Uri $uri -Method Get -ErrorAction Stop
@@ -501,8 +548,6 @@ $Region | ForEach-Object -Parallel {
         } while ($uri)
         return , $items.ToArray()
     }
-
-    Write-Host "  [$region] querying..." -ForegroundColor DarkCyan
 
     # Pricing API: skipped entirely when -SkipPricing was passed. We still emit
     # one row per (sub, sku) for availability-only output below.
@@ -671,7 +716,7 @@ $Region | ForEach-Object -Parallel {
     }
 } -ThrottleLimit $ThrottleLimit
 
-Write-Host ''
+Write-Progress -Activity 'Querying regions' -Completed
 
 # Input validation: any region that returned zero rows is a likely API failure.
 # Note: actual unknown region names are pre-filtered upstream via Get-AzLocation
@@ -743,9 +788,10 @@ if ($sorted.Count -eq 0) {
     Write-Host 'No pricing data returned. Check region names and SKU names (e.g. Standard_D2s_v5) and try again.' -ForegroundColor Red
 } else {
     # Show sub columns when we have a real sub (resolved Az context or
-    # explicit -Subscription). Skip them only in the pricing-only fallback
-    # where no sub identity was resolved at all.
-    $showSubCols = ($subs.Count -gt 1) -or ($subs[0].Id -ne '')
+    # explicit -Subscription). Skip them in the pricing-only fallback where no
+    # sub identity was resolved, and always under -SkipAvailability (where
+    # subscription scope is irrelevant and collapsed to a single row set).
+    $showSubCols = (-not $SkipAvailability) -and (($subs.Count -gt 1) -or ($subs[0].Id -ne ''))
     $cols = @()
     if ($showSubCols) {
         $cols += @{n='SubscriptionName'; e={ $_.SubscriptionName }}
@@ -801,13 +847,23 @@ if ($sorted.Count -eq 0) {
     }
 
     $sep = '  '
-    $headerLine = ($headers | ForEach-Object { $_.PadRight($widths[$_]) }) -join $sep
-    $underline  = ($headers | ForEach-Object { ('-' * $_.Length).PadRight($widths[$_]) }) -join $sep
+    # Numeric columns (monthly costs and saving percentages) are right-aligned
+    # so decimal points line up; text columns stay left-aligned.
+    $isNumeric = { param($h) $h -match '/Mo|%$' }
+    $headerLine = ($headers | ForEach-Object {
+        if (& $isNumeric $_) { $_.PadLeft($widths[$_]) } else { $_.PadRight($widths[$_]) }
+    }) -join $sep
+    $underline  = ($headers | ForEach-Object {
+        $dash = '-' * $_.Length
+        if (& $isNumeric $_) { $dash.PadLeft($widths[$_]) } else { $dash.PadRight($widths[$_]) }
+    }) -join $sep
     Write-Host $headerLine
     Write-Host $underline
     foreach ($row in $sorted) {
         $cells = for ($i = 0; $i -lt $cols.Count; $i++) {
-            (& $getCell $row $cols[$i]).PadRight($widths[$headers[$i]])
+            $h = $headers[$i]
+            $v = (& $getCell $row $cols[$i])
+            if (& $isNumeric $h) { $v.PadLeft($widths[$h]) } else { $v.PadRight($widths[$h]) }
         }
         Write-Host ($cells -join $sep)
     }
@@ -817,6 +873,7 @@ if ($sorted.Count -eq 0) {
         Write-Host "  RI/Mo = total term lump-sum (retailPrice) / term months (12 or 36)" -ForegroundColor DarkGray
         Write-Host "  SP/Mo = Savings Plan hourly commitment * $HoursPerMonth" -ForegroundColor DarkGray
         Write-Host "  Save% = saving vs PAYGO monthly (positive = cheaper than PAYGO)" -ForegroundColor DarkGray
+        Write-Host "  All amounts shown in $Currency." -ForegroundColor DarkGray
     }
 }
 
@@ -824,3 +881,5 @@ if ($OutputCsv) {
     $sorted | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
     Write-Host "`n  Exported: $OutputCsv" -ForegroundColor Green
 }
+
+if ($PassThru) { $sorted }

@@ -1,0 +1,8 @@
+# Local input files that may contain real subscription IDs or private inventories
+subs.csv
+skus.csv
+regions.csv
+
+# Generated exports
+*-prices.csv
+vm-prices.csv

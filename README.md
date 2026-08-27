@@ -56,14 +56,15 @@ Connect-AzAccount
 
 ## Usage
 
-`-VmSize` and `-Region` are required; all other parameters are optional.
+At least one VM size and one region are required (supplied inline and/or via
+CSV); all other parameters are optional.
 
 ```powershell
 .\Get-ComputeAvailability.ps1 -VmSize <string[]> -Region <string[]> `
-    [-VmSizeCsv <string>] [-SubscriptionCsv <string>] `
+    [-VmSizeCsv <string>] [-RegionCsv <string>] [-SubscriptionCsv <string>] `
     [-IncludeSpot] [-IncludeWindows] [-HoursPerMonth <int>] [-ACD <double>] `
-    [-InstanceCount <int>] [-OutputCsv <string>] [-SkipAvailability] `
-    [-SkipPricing] [-Subscription <string[]>] [-ThrottleLimit <int>]
+    [-InstanceCount <int>] [-Currency <string>] [-OutputCsv <string>] [-PassThru] `
+    [-SkipAvailability] [-SkipPricing] [-Subscription <string[]>] [-ThrottleLimit <int>]
 ```
 
 ### Parameters
@@ -71,18 +72,21 @@ Connect-AzAccount
 | Parameter | Type | Description |
 |---|---|---|
 | `-VmSize` | `string[]` | One or more ARM SKU names (e.g. `Standard_D2s_v5`, `Standard_E4s_v5`). Case is normalized automatically. Optional when `-VmSizeCsv` is supplied. |
-| `-VmSizeCsv` | `string` | Path to a CSV file of VM SKU names. Reads the first matching column named (case-insensitive) `VmSize`, `SKU`, `Size`, or `Name`; falls back to the first column. Merged with any inline `-VmSize` values. |
-| `-Region` | `string[]` | **Required.** One or more ARM region names (e.g. `australiaeast`, `northeurope`, `eastus`). Invalid names are pruned when Az is available. |
+| `-VmSizeCsv` | `string` | Path to a CSV file of VM SKU names. Values may be comma-separated on one line, one per line, or a mix, with or without a header row (a leading `VmSize`/`SKU`/`Size`/`Name` header is ignored). Merged with any inline `-VmSize` values. |
+| `-Region` | `string[]` | One or more ARM region names (e.g. `australiaeast`, `northeurope`, `eastus`). Invalid names are pruned when Az is available. Optional when `-RegionCsv` is supplied. |
+| `-RegionCsv` | `string` | Path to a CSV file of ARM region names. Values may be comma-separated on one line, one per line, or a mix, with or without a header row (a leading `Region`/`Location`/`Name` header is ignored). Merged with any inline `-Region` values. |
 | `-IncludeSpot` | `switch` | Include Spot pricing. Spot is highly variable; the API returns the current published rate at query time. |
 | `-IncludeWindows` | `switch` | Add Windows-licensed rows alongside Linux. Windows rows bundle the Windows Server license premium (not discounted by RI/SP). |
 | `-HoursPerMonth` | `int` | Hours used to project hourly rates into monthly costs. Default `730` (Azure billing convention: 365.25 × 24 / 12). |
 | `-ACD` | `double` | All-up customer discount percentage (0–100) applied to the PAYGO rate to reflect EA/MCA negotiated pricing. RI/SP rates are unchanged; Save% is recalculated against the discounted baseline. Default `0`. |
 | `-InstanceCount` | `int` | Multiply all monthly cost columns by this count to project an N-instance deployment. Save% is unaffected. Default `1`. |
+| `-Currency` | `string` | ISO currency code (e.g. `USD`, `EUR`, `GBP`, `AUD`) passed to the Retail Prices API. All monetary columns are expressed in this currency. Default `USD`. |
 | `-OutputCsv` | `string` | Optional path to export results as a CSV file. |
+| `-PassThru` | `switch` | Also emit the result rows as objects to the pipeline (in addition to the console table) for further filtering, sorting, or exporting. |
 | `-SkipAvailability` | `switch` | Skip the `Microsoft.Compute/skus` lookup for a faster pricing-only run. |
 | `-SkipPricing` | `switch` | Skip the Retail Prices API for an availability-only matrix. Cannot be combined with `-SkipAvailability`. |
 | `-Subscription` | `string[]` | One or more subscription names or IDs. Each gets its own rows (availability is subscription-scoped). Defaults to the current Az context. |
-| `-SubscriptionCsv` | `string` | Path to a CSV file of subscription names or IDs. Reads the first matching column named (case-insensitive) `Subscription`, `SubscriptionId`, `SubscriptionName`, `Id`, or `Name`; falls back to the first column. Merged with any inline `-Subscription` values. |
+| `-SubscriptionCsv` | `string` | Path to a CSV file of subscription names or IDs. Values may be comma-separated on one line, one per line, or a mix, with or without a header row (a leading `Subscription`/`SubscriptionId`/`SubscriptionName`/`Id`/`Name` header is ignored). Merged with any inline `-Subscription` values. |
 | `-ThrottleLimit` | `int` | Max parallel region/subscription queries. Default `5`. |
 
 ### Examples
@@ -109,11 +113,16 @@ Connect-AzAccount
 
 # Read SKUs and subscriptions from CSV files (merged with any inline values)
 .\Get-ComputeAvailability.ps1 -Region eastus,westus2 -VmSizeCsv .\skus.csv -SubscriptionCsv .\subs.csv
+
+# Price in euros and pipe the objects on for further filtering
+.\Get-ComputeAvailability.ps1 -Region westeurope -VmSize Standard_D2s_v5 -Currency EUR -PassThru |
+    Where-Object RI_3Yr_Save_Pct -gt 40 | Sort-Object RI_3Yr_PerMonth
 ```
 
-The CSV files use a simple header row. The script looks for a recognized column
-(case-insensitive) and falls back to the first column, so a single-column file
-works with any header:
+The CSV files are parsed layout-agnostically: values may be comma-separated on
+one line, one per line, or a mix, with or without a header row. A leading
+header token (e.g. `VmSize`, `Region`, `Subscription`) is ignored, so a plain
+list works too:
 
 ```csv
 VmSize
@@ -151,7 +160,8 @@ One row per subscription × region × VM size (× OS when `-IncludeWindows` is s
 | `SP3Yr/Mo` / `SP3Yr%` | Savings Plan 3-year monthly cost and saving. |
 
 Values that are unavailable for a given SKU/region show `N/A`. All costs are
-**monthly USD**.
+**monthly** amounts in the selected `-Currency` (default USD), formatted with
+thousands separators.
 
 ### How the numbers are derived
 
