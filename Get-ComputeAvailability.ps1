@@ -21,9 +21,10 @@
       - Restrictions: 'None', the restriction detail (e.g. "Region" for a
         subscription-level block, or "Zone 1,2,3" for blocked zones), or
         "VM size not available in region." when the SKU is not listed.
-        A restriction means the capacity exists but is blocked for the
-        subscription/zone and requires a support request (quota / allowlist)
-        to unblock - unlike 'Unavailable', where the SKU simply isn't offered.
+        A restriction means the capability exists (the size is offered) but is
+        currently blocked for the subscription regionally and/or zonally; these
+        are allowlist gates that require a support case to unblock - unlike
+        'Unavailable', where the SKU simply isn't offered.
 
     Compute has BOTH commitment-discount mechanisms (unlike storage):
       - Reserved Instances (RI):  SKU-locked, 1-year or 3-year terms.
