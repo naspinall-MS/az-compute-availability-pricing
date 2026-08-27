@@ -13,8 +13,9 @@ one or more subscriptions, regions, and VM sizes.
 
 | Dimension | Detail | Data source |
 |---|---|---|
-| Region access | `Allowed` or `RESTRICTED` (subscription-level Location restriction) | `Microsoft.Compute/skus` (ARM) |
-| Zone access | Zones supported in the region (e.g. `1,2,3`), with subscription-blocked zones removed | `Microsoft.Compute/skus` (ARM) |
+| Region availability | `Available` (SKU listed/offered in the region) or `Unavailable` (not listed) | `Microsoft.Compute/skus` (ARM) |
+| Zone availability | Zones the SKU is offered in (e.g. `1,2,3`), `N/A` (non-zonal), or `Unavailable` (not listed) | `Microsoft.Compute/skus` (ARM) |
+| Restrictions | Region/zone restriction detail (`Region` and/or `Zone 1,2,3`) — capacity exists but needs a support request | `Microsoft.Compute/skus` (ARM) |
 | PAYGO | Pay-as-you-go monthly compute cost | Azure Retail Prices API |
 | Spot | Current published Spot monthly rate + saving vs PAYGO | Azure Retail Prices API |
 | Reserved Instance | 1-year and 3-year monthly cost + saving vs PAYGO | Azure Retail Prices API |
@@ -36,7 +37,20 @@ one or more subscriptions, regions, and VM sizes.
   restrictions are subscription-scoped, each subscription is queried separately.
 
 If the availability lookup is unavailable (no Az context, or `-SkipAvailability`),
-the script still returns pricing data and the access/zone columns show `?`.
+the script still returns pricing data and the availability columns show `?`.
+
+### Availability vs. restrictions
+
+These two concepts are reported separately and mean different things:
+
+- **Availability** (`RegionAvailability` / `ZoneAvailability` = `Available`)
+  means the VM size is **present** — Azure offers (lists) the SKU in that
+  region/zone. `Unavailable` means the SKU simply isn't offered there and no
+  action will change that (you must pick a different region or VM size).
+- **Restrictions** mean the capacity **exists** but is currently **blocked**
+  for your subscription (or specific zones). This is a quota / allowlist gate,
+  so it is typically unblocked by **raising a support request** (quota increase
+  or SKU enablement), not by changing regions.
 
 ## Requirements
 
@@ -150,8 +164,9 @@ One row per subscription × region × VM size (× OS when `-IncludeWindows` is s
 | `SubscriptionName` / `SubscriptionId` | The subscription the row applies to (shown only when a real subscription is resolved). |
 | `Region` / `VmSize` | The ARM region and SKU. |
 | `OS` | `Linux` or `Windows` (only shown with `-IncludeWindows`). |
-| `RegionAccess` | `Allowed`, `RESTRICTED`, `not listed`, or `?` (lookup skipped/unavailable). |
-| `ZoneAccess` | Supported zones (e.g. `1,2,3`), `N/A` (no zonal deployment), `-` (region restricted), `not listed`, or `?`. |
+| `RegionAvailability` | `Available` (SKU listed/offered in the region) or `Unavailable` (not listed); `?` when the lookup is skipped/unavailable. |
+| `ZoneAvailability` | Zones the SKU is offered in for the region (e.g. `1,2,3`). `N/A` for a non-zonal region, `Unavailable` when the SKU is not listed, or `?`. |
+| `Restrictions` | `None`, the restriction detail (`Region` for a subscription-level block and/or `Zone 1,2,3` for blocked zones), or `VM size not available in region.` when the SKU is not listed. A restriction means capacity exists but needs a support request to unblock. `?` when the lookup is unavailable. |
 | `PAYGO/Mo` | Pay-as-you-go monthly cost. Header shows `(-N%)` when `-ACD` is applied. |
 | `Spot/Mo` / `Spot%` | Spot monthly cost and saving vs PAYGO (with `-IncludeSpot`). |
 | `RI1Yr/Mo` / `RI1Yr%` | Reserved Instance 1-year monthly cost and saving. |

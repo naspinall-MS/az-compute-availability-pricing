@@ -10,15 +10,20 @@
       - Availability: Get-AzComputeResourceSku (requires Az.Compute module and
                       a logged-in Azure context via Connect-AzAccount). When
                       unavailable, the script still returns pricing data and
-                      the Zones column shows '?'.
+                      the availability columns show '?'.
 
-    Availability info surfaces:
-      - Region access: 'Allowed' or 'RESTRICTED' (subscription-level Location
-        restriction; SKU cannot be deployed in the region at all)
-      - Zones supported in the region (e.g. "1,2,3"), excluding any zones the
-        subscription is blocked from (Zone-type restrictions)
-      - 'N/A' when the SKU has no zonal deployment in the region
-      - '?' when availability lookup was skipped or unavailable
+    Availability info surfaces as three separate columns:
+      - RegionAvailability: 'Available' (the SKU is listed/offered in the
+        region) or 'Unavailable' (not listed); '?' when the lookup was skipped.
+      - ZoneAvailability: the zones the SKU is offered in (e.g. "1,2,3"),
+        'N/A' for a non-zonal region, 'Unavailable' when the SKU is not listed
+        in the region, or '?'.
+      - Restrictions: 'None', the restriction detail (e.g. "Region" for a
+        subscription-level block, or "Zone 1,2,3" for blocked zones), or
+        "VM size not available in region." when the SKU is not listed.
+        A restriction means the capacity exists but is blocked for the
+        subscription/zone and requires a support request (quota / allowlist)
+        to unblock - unlike 'Unavailable', where the SKU simply isn't offered.
 
     Compute has BOTH commitment-discount mechanisms (unlike storage):
       - Reserved Instances (RI):  SKU-locked, 1-year or 3-year terms.
@@ -99,9 +104,9 @@
 
 .PARAMETER SkipPricing
     Skip the Azure Retail Prices API queries. Produces an availability-only
-    matrix (subscription, region, SKU + RegionAccess/ZoneAccess). All pricing
-    columns (PAYGO, Spot, RI, SP) are omitted from output and CSV. Cannot be
-    combined with -SkipAvailability.
+    matrix (subscription, region, SKU + RegionAvailability/ZoneAvailability/
+    Restrictions). All pricing columns (PAYGO, Spot, RI, SP) are omitted from
+    output and CSV. Cannot be combined with -SkipAvailability.
 
 .PARAMETER Subscription
     One or more subscription names or IDs to evaluate. SKU availability and
@@ -290,7 +295,9 @@ $azAvailable = $false
 try {
     $null = Get-Command Get-AzContext -ErrorAction Stop
     $azAvailable = $true
-} catch { }
+} catch {
+    Write-Verbose "Az.Accounts not available: $($_.Exception.Message)"
+}
 
 if ($SkipAvailability -and $Subscription.Count -gt 0) {
     Write-Warning "-Subscription is ignored with -SkipAvailability (subscription scope only affects availability); pricing is identical across subscriptions, so a single row set is produced."
@@ -302,9 +309,11 @@ if ($Subscription.Count -gt 0 -and -not $SkipAvailability) {
     } else {
         foreach ($s in $Subscription) {
             $resolved = $null
-            try { $resolved = Get-AzSubscription -SubscriptionName $s -ErrorAction Stop } catch { }
+            try { $resolved = Get-AzSubscription -SubscriptionName $s -ErrorAction Stop }
+            catch { Write-Verbose "No subscription matched by name '$s': $($_.Exception.Message)" }
             if (-not $resolved) {
-                try { $resolved = Get-AzSubscription -SubscriptionId $s -ErrorAction Stop } catch { }
+                try { $resolved = Get-AzSubscription -SubscriptionId $s -ErrorAction Stop }
+                catch { Write-Verbose "No subscription matched by id '$s': $($_.Exception.Message)" }
             }
             if ($resolved) {
                 $subs.Add(@{ Name = $resolved.Name; Id = $resolved.Id })
@@ -323,7 +332,9 @@ if ($subs.Count -eq 0) {
             if ($ctx -and $ctx.Subscription) {
                 $subs.Add(@{ Name = $ctx.Subscription.Name; Id = $ctx.Subscription.Id })
             }
-        } catch { }
+        } catch {
+            Write-Verbose "Could not read current Az context: $($_.Exception.Message)"
+        }
     }
     if ($subs.Count -eq 0) { $subs.Add(@{ Name = ''; Id = '' }) }
 }
@@ -361,7 +372,8 @@ if ($azAvailable -and ($subs[0].Id -ne '')) {
     }
 }
 
-# Availability map keyed "subId|region|sku" -> @{ Zones; RegionBlocked; Reason }
+# Availability map keyed "subId|region|sku" ->
+#   @{ PhysicalZones; RegionBlocked; RegionReason; RestrictedZones; ZoneReason }
 # Parallelized across (sub x region) work items via ARM REST. We acquire a
 # single Bearer token up front and reuse it in every parallel runspace, which
 # avoids per-sub Set-AzContext serialization and gives the same ThrottleLimit
@@ -419,44 +431,54 @@ if (-not $SkipAvailability) {
                     if ($s.resourceType -ne 'virtualMachines') { continue }
                     if (-not $skuSet.Contains($s.name))        { continue }
 
-                    # Start with all zones the SKU lists in this region, then
-                    # subtract any zones explicitly restricted for the sub.
-                    $allZones = @()
+                    # Physical zones the SKU is offered in for this region
+                    # (raw locationInfo, NOT reduced by restrictions).
+                    $physicalZones = @()
                     if ($s.locationInfo -and $s.locationInfo[0].zones) {
-                        $allZones = @($s.locationInfo[0].zones | Sort-Object)
+                        $physicalZones = @($s.locationInfo[0].zones | Sort-Object)
                     }
-                    $allowedZones  = $allZones
-                    $regionBlocked = $false
-                    $reason        = ''
+                    # Restrictions are kept separate from physical availability:
+                    #   Location -> whole SKU unavailable to the sub in the region
+                    #   Zone     -> specific zones unavailable to the sub
+                    $regionBlocked   = $false
+                    $regionReason    = ''
+                    $restrictedZones = @()
+                    $zoneReason      = ''
                     if ($s.restrictions) {
                         foreach ($rest in $s.restrictions) {
-                            if ($rest.reasonCode) { $reason = $rest.reasonCode }
                             switch ($rest.type) {
-                                'Location' { $regionBlocked = $true }
+                                'Location' {
+                                    $regionBlocked = $true
+                                    if ($rest.reasonCode) { $regionReason = $rest.reasonCode }
+                                }
                                 'Zone'     {
-                                    $blockedZones = @()
                                     if ($rest.restrictionInfo -and $rest.restrictionInfo.zones) {
-                                        $blockedZones = @($rest.restrictionInfo.zones)
+                                        $restrictedZones += @($rest.restrictionInfo.zones)
                                     }
-                                    $allowedZones = @($allowedZones | Where-Object { $_ -notin $blockedZones })
+                                    if ($rest.reasonCode) { $zoneReason = $rest.reasonCode }
                                 }
                             }
                         }
                     }
+                    $restrictedZones = @($restrictedZones | Sort-Object -Unique)
                     $bag.Add(@{
-                        Key            = "$($item.SubId)|$($item.Region)|$($s.name)"
-                        Zones          = $allowedZones
-                        RegionBlocked  = $regionBlocked
-                        Reason         = $reason
+                        Key             = "$($item.SubId)|$($item.Region)|$($s.name)"
+                        PhysicalZones   = $physicalZones
+                        RegionBlocked   = $regionBlocked
+                        RegionReason    = $regionReason
+                        RestrictedZones = $restrictedZones
+                        ZoneReason      = $zoneReason
                     })
                 }
             } -ThrottleLimit $ThrottleLimit
 
             foreach ($entry in $availResults) {
                 $availMap[$entry.Key] = @{
-                    Zones          = $entry.Zones
-                    RegionBlocked  = $entry.RegionBlocked
-                    Reason         = $entry.Reason
+                    PhysicalZones   = $entry.PhysicalZones
+                    RegionBlocked   = $entry.RegionBlocked
+                    RegionReason    = $entry.RegionReason
+                    RestrictedZones = $entry.RestrictedZones
+                    ZoneReason      = $entry.ZoneReason
                 }
             }
             Write-Progress -Activity 'SKU availability lookup' -Completed
@@ -670,22 +692,35 @@ $Region | ForEach-Object -Parallel {
         }
 
         # Availability lookup (may be absent if -SkipAvailability or auth failed)
-        $regionAccess = '?'
-        $zonesStr     = '?'
+        $regionAvail   = '?'
+        $zoneAvail     = '?'
+        $restriction   = '?'
         $regionBlocked = $false
-        $reason       = ''
         if ($availOn -and $sub.Id) {
             $info = $availMap["$($sub.Id)|$region|$sku"]
             if ($info) {
+                # Column 1: the SKU is listed (offered) in the region.
+                $regionAvail   = 'Available'
                 $regionBlocked = [bool]$info.RegionBlocked
-                $reason        = [string]$info.Reason
-                $regionAccess  = if ($regionBlocked) { 'RESTRICTED' } else { 'Allowed' }
-                $zonesStr      = if ($regionBlocked)               { '-' }
-                                 elseif ($info.Zones.Count -eq 0)  { 'N/A' }
-                                 else { ($info.Zones -join ',') }
+
+                # Column 2: zones the SKU is physically present in (unreduced).
+                $zoneAvail     = if ($info.PhysicalZones.Count -eq 0) { 'N/A' }
+                                 else { ($info.PhysicalZones -join ',') }
+
+                # Column 3: restriction detail (region and/or zone).
+                $parts = @()
+                if ($regionBlocked) {
+                    $parts += 'Region'
+                }
+                if ($info.RestrictedZones.Count -gt 0) {
+                    $parts += "Zone $($info.RestrictedZones -join ',')"
+                }
+                $restriction = if ($parts.Count -gt 0) { $parts -join '; ' } else { 'None' }
             } else {
-                $regionAccess = 'not listed'
-                $zonesStr     = 'not listed'
+                # SKU is not listed (offered) in the region for this subscription.
+                $regionAvail = 'Unavailable'
+                $zoneAvail   = 'Unavailable'
+                $restriction = 'VM size not available in region.'
             }
         }
 
@@ -694,11 +729,11 @@ $Region | ForEach-Object -Parallel {
             SubscriptionId   = $sub.Id
             Region          = $region
             VmSize          = $sku
+            RegionAvailability = $regionAvail
+            ZoneAvailability   = $zoneAvail
+            Restrictions       = $restriction
+            RegionBlocked      = $regionBlocked
             OS              = $os
-            RegionAccess    = $regionAccess
-            ZoneAccess      = $zonesStr
-            RegionBlocked   = $regionBlocked
-            RestrictReason  = $reason
             PAYGO_PerMonth  = if ($null -ne $payMo)  { [Math]::Round($payMo, 2) }  else { $null }
             Spot_PerMonth   = if ($null -ne $spotMo) { [Math]::Round($spotMo, 2) } else { $null }
             Spot_Saving_Pct = $spotPct
@@ -784,6 +819,38 @@ if (-not $SkipPricing) {
 
 $sorted = @($rows | Sort-Object SubscriptionName, Region, VmSize, OS)
 
+# Show sub columns when we have a real sub (resolved Az context or explicit
+# -Subscription). Skip them in the pricing-only fallback where no sub identity
+# was resolved, and always under -SkipAvailability (where subscription scope is
+# irrelevant and collapsed to a single row set).
+$showSubCols = (-not $SkipAvailability) -and (($subs.Count -gt 1) -or ($subs[0].Id -ne ''))
+
+# Property list for the CSV export - kept in lock-step with the console columns
+# below so the file only contains fields the user actually sees (raw values,
+# not the display-formatted strings). OS is grouped with the pricing fields.
+$csvProps = @()
+if ($showSubCols) { $csvProps += 'SubscriptionName', 'SubscriptionId' }
+$csvProps += 'Region', 'VmSize'
+if (-not $SkipAvailability) {
+    $csvProps += 'RegionAvailability', 'ZoneAvailability', 'Restrictions'
+}
+if (-not $SkipPricing) {
+    if ($IncludeWindows) { $csvProps += 'OS' }
+    $csvProps += 'PAYGO_PerMonth'
+    if ($IncludeSpot) { $csvProps += 'Spot_PerMonth', 'Spot_Saving_Pct' }
+    $csvProps += 'RI_1Yr_PerMonth', 'RI_1Yr_Save_Pct',
+                 'RI_3Yr_PerMonth', 'RI_3Yr_Save_Pct',
+                 'SP_1Yr_PerMonth', 'SP_1Yr_Save_Pct',
+                 'SP_3Yr_PerMonth', 'SP_3Yr_Save_Pct'
+    # Run-level pricing context - not shown as table columns, but captured in the
+    # CSV so the export is self-describing (currency, whether spot/Windows-license
+    # figures were requested, and the hours/month used for Savings Plan math).
+    $csvProps += @{Name='Currency';               Expression={ $Currency }},
+                 @{Name='SpotIncluded';           Expression={ [bool]$IncludeSpot }},
+                 @{Name='WindowsLicenseIncluded'; Expression={ [bool]$IncludeWindows }},
+                 @{Name='HoursPerMonth';          Expression={ $HoursPerMonth }}
+}
+
 if ($sorted.Count -eq 0) {
     Write-Host 'No pricing data returned. Check region names and SKU names (e.g. Standard_D2s_v5) and try again.' -ForegroundColor Red
 } else {
@@ -791,19 +858,19 @@ if ($sorted.Count -eq 0) {
     # explicit -Subscription). Skip them in the pricing-only fallback where no
     # sub identity was resolved, and always under -SkipAvailability (where
     # subscription scope is irrelevant and collapsed to a single row set).
-    $showSubCols = (-not $SkipAvailability) -and (($subs.Count -gt 1) -or ($subs[0].Id -ne ''))
     $cols = @()
     if ($showSubCols) {
         $cols += @{n='SubscriptionName'; e={ $_.SubscriptionName }}
         $cols += @{n='SubscriptionId';   e={ $_.SubscriptionId }}
     }
     $cols += @('Region', 'VmSize')
-    if ($IncludeWindows -and -not $SkipPricing) { $cols += @{n='OS'; e={ $_.OS }} }
     if (-not $SkipAvailability) {
-        $cols += @{n='RegionAccess'; e={ $_.RegionAccess }}
-        $cols += @{n='ZoneAccess';   e={ $_.ZoneAccess }}
+        $cols += @{n='RegionAvailability'; e={ $_.RegionAvailability }}
+        $cols += @{n='ZoneAvailability';   e={ $_.ZoneAvailability }}
+        $cols += @{n='Restrictions';       e={ $_.Restrictions }}
     }
     if (-not $SkipPricing) {
+        if ($IncludeWindows) { $cols += @{n='OS'; e={ $_.OS }} }
         $cols += @(
             @{n=$(if ($ACD -gt 0) { "PAYGO/Mo(-$ACD%)" } else { 'PAYGO/Mo' }); e={ Format-Price $_.PAYGO_PerMonth }}
         )
@@ -878,7 +945,7 @@ if ($sorted.Count -eq 0) {
 }
 
 if ($OutputCsv) {
-    $sorted | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
+    $sorted | Select-Object $csvProps | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
     Write-Host "`n  Exported: $OutputCsv" -ForegroundColor Green
 }
 
