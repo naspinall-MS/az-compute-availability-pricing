@@ -151,7 +151,7 @@ One row per subscription × region × VM size (× OS when `-IncludeWindows` is s
 | `Region` / `VmSize` | The ARM region and SKU. |
 | `OS` | `Linux` or `Windows` (only shown with `-IncludeWindows`). |
 | `RegionAccess` | `Allowed`, `RESTRICTED`, `not listed`, or `?` (lookup skipped/unavailable). |
-| `ZoneAccess` | Supported zones (e.g. `1,2,3`), `none` (no zonal deployment), `-` (region restricted), `not listed`, or `?`. |
+| `ZoneAccess` | Supported zones (e.g. `1,2,3`), `N/A` (no zonal deployment), `-` (region restricted), `not listed`, or `?`. |
 | `PAYGO/Mo` | Pay-as-you-go monthly cost. Header shows `(-N%)` when `-ACD` is applied. |
 | `Spot/Mo` / `Spot%` | Spot monthly cost and saving vs PAYGO (with `-IncludeSpot`). |
 | `RI1Yr/Mo` / `RI1Yr%` | Reserved Instance 1-year monthly cost and saving. |

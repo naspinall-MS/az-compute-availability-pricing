@@ -17,7 +17,7 @@
         restriction; SKU cannot be deployed in the region at all)
       - Zones supported in the region (e.g. "1,2,3"), excluding any zones the
         subscription is blocked from (Zone-type restrictions)
-      - 'none' when the SKU has no zonal deployment in the region
+      - 'N/A' when the SKU has no zonal deployment in the region
       - '?' when availability lookup was skipped or unavailable
 
     Compute has BOTH commitment-discount mechanisms (unlike storage):
@@ -681,7 +681,7 @@ $Region | ForEach-Object -Parallel {
                 $reason        = [string]$info.Reason
                 $regionAccess  = if ($regionBlocked) { 'RESTRICTED' } else { 'Allowed' }
                 $zonesStr      = if ($regionBlocked)               { '-' }
-                                 elseif ($info.Zones.Count -eq 0)  { 'none' }
+                                 elseif ($info.Zones.Count -eq 0)  { 'N/A' }
                                  else { ($info.Zones -join ',') }
             } else {
                 $regionAccess = 'not listed'
