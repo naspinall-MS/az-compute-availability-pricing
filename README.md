@@ -76,10 +76,10 @@ CSV); all other parameters are optional.
 
 ```powershell
 .\Get-ComputeAvailability.ps1 -VmSize <string[]> -Region <string[]> `
-    [-VmSizeCsv <string>] [-RegionCsv <string>] [-SubscriptionCsv <string>] `
+    [-VmSizeCsv <string>] [-RegionCsv <string>] [-SubscriptionIdCsv <string>] `
     [-IncludeSpot] [-IncludeWindows] [-HoursPerMonth <int>] [-ACD <double>] `
     [-InstanceCount <int>] [-Currency <string>] [-OutputCsv <string>] [-PassThru] `
-    [-SkipAvailability] [-SkipPricing] [-Subscription <string[]>] [-ThrottleLimit <int>]
+    [-SkipAvailability] [-SkipPricing] [-SubscriptionId <string[]>] [-ThrottleLimit <int>]
 ```
 
 ### Parameters
@@ -100,8 +100,8 @@ CSV); all other parameters are optional.
 | `-PassThru` | `switch` | Also emit the result rows as objects to the pipeline (in addition to the console table) for further filtering, sorting, or exporting. |
 | `-SkipAvailability` | `switch` | Skip the `Microsoft.Compute/skus` lookup for a faster pricing-only run. |
 | `-SkipPricing` | `switch` | Skip the Retail Prices API for an availability-only matrix. Cannot be combined with `-SkipAvailability`. |
-| `-Subscription` | `string[]` | One or more subscription names or IDs. Each gets its own rows (availability is subscription-scoped). Defaults to the current Az context. |
-| `-SubscriptionCsv` | `string` | Path to a CSV file of subscription names or IDs. Values may be comma-separated on one line, one per line, or a mix, with or without a header row (a leading `Subscription`/`SubscriptionId`/`SubscriptionName`/`Id`/`Name` header is ignored). Merged with any inline `-Subscription` values. |
+| `-SubscriptionId` | `string[]` | One or more subscription IDs (GUIDs). Each gets its own rows (availability is subscription-scoped). IDs are required rather than display names, which aren't guaranteed unique. Defaults to the current Az context. |
+| `-SubscriptionIdCsv` | `string` | Path to a CSV file of subscription IDs (GUIDs). Values may be comma-separated on one line, one per line, or a mix, with or without a header row (a leading `SubscriptionId`/`Subscription`/`Id` header is ignored). Merged with any inline `-SubscriptionId` values. |
 | `-ThrottleLimit` | `int` | Max parallel region/subscription queries. Default `5`. |
 
 ### Examples
@@ -121,13 +121,13 @@ CSV); all other parameters are optional.
 
 # Availability-only matrix across multiple subscriptions (no pricing)
 .\Get-ComputeAvailability.ps1 -Region eastus,westus2 -VmSize Standard_D2s_v5 `
-    -Subscription 'Prod','Dev' -SkipPricing
+    -SubscriptionId '11111111-1111-1111-1111-111111111111','22222222-2222-2222-2222-222222222222' -SkipPricing
 
 # Fast pricing-only run (skip the ARM availability lookup)
 .\Get-ComputeAvailability.ps1 -Region eastus -VmSize Standard_D2s_v5 -SkipAvailability
 
-# Read SKUs and subscriptions from CSV files (merged with any inline values)
-.\Get-ComputeAvailability.ps1 -Region eastus,westus2 -VmSizeCsv .\skus.csv -SubscriptionCsv .\subs.csv
+# Read SKUs and subscription IDs from CSV files (merged with any inline values)
+.\Get-ComputeAvailability.ps1 -Region eastus,westus2 -VmSizeCsv .\skus.csv -SubscriptionIdCsv .\subs.csv
 
 # Price in euros and pipe the objects on for further filtering
 .\Get-ComputeAvailability.ps1 -Region westeurope -VmSize Standard_D2s_v5 -Currency EUR -PassThru |
@@ -136,7 +136,7 @@ CSV); all other parameters are optional.
 
 The CSV files are parsed layout-agnostically: values may be comma-separated on
 one line, one per line, or a mix, with or without a header row. A leading
-header token (e.g. `VmSize`, `Region`, `Subscription`) is ignored, so a plain
+header token (e.g. `VmSize`, `Region`, `SubscriptionId`) is ignored, so a plain
 list works too:
 
 ```csv
@@ -146,9 +146,9 @@ Standard_E4s_v5
 ```
 
 ```csv
-Subscription
-Production
-00000000-0000-0000-0000-000000000000
+SubscriptionId
+11111111-1111-1111-1111-111111111111
+22222222-2222-2222-2222-222222222222
 ```
 
 ## Output
@@ -193,9 +193,10 @@ thousands separators.
 
 ### CSV export
 
-When `-OutputCsv` is supplied, all rows are written to that path with the full
-column set (including the raw `RegionBlocked` and `RestrictReason` fields), so
-the CSV can carry more detail than the console table.
+When `-OutputCsv` is supplied, every row is written to that path using the same
+columns shown in the console table (as raw, unformatted values), plus a few
+run-context fields (`Currency`, `SpotIncluded`, `WindowsLicenseIncluded`,
+`HoursPerMonth`) so the export is self-describing.
 
 ## How it works
 
@@ -220,5 +221,8 @@ the CSV can carry more detail than the console table.
 - **Azure Hybrid Benefit (AHB)** users should ignore Windows rows and use the
   Linux rows plus their own AHB-licensed pricing.
 - Spot rates fluctuate; the reported value is a point-in-time snapshot.
-- Availability data reflects the **subscription** you're authenticated against —
-  restrictions differ between subscriptions.
+- Availability and restrictions are **subscription-scoped**. Pass one or more
+  `-SubscriptionId` (GUIDs) to evaluate specific subscriptions; when omitted the
+  current Az context is used. Unresolvable IDs are warned and skipped, and if
+  *none* of the specified IDs resolve the run stops with an error rather than
+  silently falling back to your current context.

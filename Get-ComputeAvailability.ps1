@@ -7,10 +7,11 @@
 .DESCRIPTION
     Two data sources:
       - Pricing:      Azure Retail Prices API (no auth required, public).
-      - Availability: Get-AzComputeResourceSku (requires Az.Compute module and
-                      a logged-in Azure context via Connect-AzAccount). When
-                      unavailable, the script still returns pricing data and
-                      the availability columns show '?'.
+      - Availability: Microsoft.Compute/skus ARM REST endpoint (requires the
+                      Az.Accounts module and a logged-in Azure context via
+                      Connect-AzAccount for the bearer token). When unavailable,
+                      the script still returns pricing data and the availability
+                      columns show '?'.
 
     Availability info surfaces as three separate columns:
       - RegionAvailability: 'Available' (the SKU is listed/offered in the
@@ -100,7 +101,7 @@
     Optional path to export results as a CSV file.
 
 .PARAMETER SkipAvailability
-    Skip the Get-AzComputeResourceSku availability lookup even if Az.Compute
+    Skip the Microsoft.Compute/skus availability lookup even if Az.Accounts
     and an Azure context are available. Useful for faster pricing-only runs.
 
 .PARAMETER SkipPricing
@@ -109,19 +110,19 @@
     Restrictions). All pricing columns (PAYGO, Spot, RI, SP) are omitted from
     output and CSV. Cannot be combined with -SkipAvailability.
 
-.PARAMETER Subscription
-    One or more subscription names or IDs to evaluate. SKU availability and
-    restrictions are subscription-scoped, so each sub gets its own row. When
-    omitted, the current Az context subscription is used. Pricing data is
-    public (Retail API) and identical across subs, so it is queried once per
-    region and reused.
+.PARAMETER SubscriptionId
+    One or more subscription IDs (GUIDs) to evaluate. SKU availability and
+    restrictions are subscription-scoped, so each sub gets its own row. IDs are
+    required (rather than display names) because names are not guaranteed unique
+    across tenants. When omitted, the current Az context subscription is used.
+    Pricing data is public (Retail API) and identical across subs, so it is
+    queried once per region and reused.
 
-.PARAMETER SubscriptionCsv
-    Path to a CSV file listing subscription names or IDs to evaluate. Values may
+.PARAMETER SubscriptionIdCsv
+    Path to a CSV file listing subscription IDs (GUIDs) to evaluate. Values may
     be comma-separated on one line, one per line, or a mix, with or without a
-    header row (a leading Subscription/SubscriptionId/SubscriptionName/Id/Name
-    header is ignored). Values are merged with any inline -Subscription values
-    and de-duplicated.
+    header row (a leading SubscriptionId/Subscription/Id header is ignored).
+    Values are merged with any inline -SubscriptionId values and de-duplicated.
 
 .PARAMETER Currency
     ISO currency code for pricing (e.g. USD, EUR, GBP, AUD). Passed to the Azure
@@ -142,7 +143,7 @@
     .\Get-ComputeAvailability.ps1 -Region eastus -VmSize Standard_E8s_v5 -IncludeSpot -OutputCsv .\vm-prices.csv
 
 .EXAMPLE
-    .\Get-ComputeAvailability.ps1 -RegionCsv .\regions.csv -VmSizeCsv .\skus.csv -SubscriptionCsv .\subs.csv
+    .\Get-ComputeAvailability.ps1 -RegionCsv .\regions.csv -VmSizeCsv .\skus.csv -SubscriptionIdCsv .\subs.csv
 
 .EXAMPLE
     .\Get-ComputeAvailability.ps1 -Region westeurope -VmSize Standard_D2s_v5 -Currency EUR -PassThru |
@@ -169,8 +170,9 @@ param(
     [switch]$PassThru,
     [switch]$SkipAvailability,
     [switch]$SkipPricing,
-    [string[]]$Subscription  = @(),
-    [string]$SubscriptionCsv = '',
+    [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
+    [string[]]$SubscriptionId  = @(),
+    [string]$SubscriptionIdCsv = '',
     [ValidateRange(1, [int]::MaxValue)]
     [int]$ThrottleLimit      = 5
 )
@@ -185,7 +187,7 @@ if ($SkipAvailability -and $SkipPricing) {
 
 # ----- CSV-sourced VM sizes / subscriptions --------------------------------
 # Read SKU names and/or subscription identifiers from CSV files and merge them
-# with any inline -VmSize / -Subscription values. Values are trimmed, blanks
+# with any inline -VmSize / -SubscriptionId values. Values are trimmed, blanks
 # dropped, and duplicates removed. Any layout is accepted: values may be
 # comma-separated on one line, one per line, or a mix, with or without a header
 # row. Tokens matching a known header name (case-insensitive) are discarded.
@@ -218,9 +220,9 @@ if ($RegionCsv) {
     $csvRegions = Import-CsvValues -Path $RegionCsv -Header @('Region','Location','Name')
     $Region     = @($Region + $csvRegions | Where-Object { $_ } | Select-Object -Unique)
 }
-if ($SubscriptionCsv) {
-    $csvSubs      = Import-CsvValues -Path $SubscriptionCsv -Header @('Subscription','SubscriptionId','SubscriptionName','Id','Name')
-    $Subscription = @($Subscription + $csvSubs | Where-Object { $_ } | Select-Object -Unique)
+if ($SubscriptionIdCsv) {
+    $csvSubs        = Import-CsvValues -Path $SubscriptionIdCsv -Header @('SubscriptionId','Subscription','Id')
+    $SubscriptionId = @($SubscriptionId + $csvSubs | Where-Object { $_ } | Select-Object -Unique)
 }
 
 if ($VmSize.Count -eq 0) {
@@ -235,7 +237,7 @@ Write-Host '================================================================' -F
 Write-Host '  Azure Virtual Machine Availability + Price Comparison' -ForegroundColor Cyan
 Write-Host "  Regions        : $($Region -join ', ')" -ForegroundColor Cyan
 Write-Host "  VM Sizes       : $($VmSize -join ', ')" -ForegroundColor Cyan
-if ($Subscription -and -not $SkipAvailability) { Write-Host "  Subscriptions  : $($Subscription -join ', ')" -ForegroundColor Cyan }
+if ($SubscriptionId -and -not $SkipAvailability) { Write-Host "  Subscriptions  : $($SubscriptionId -join ', ')" -ForegroundColor Cyan }
 # Spot / license / hours / discount / instance options only affect pricing output,
 # and the licensing NOTE with them; hide the whole group when pricing is skipped.
 if (-not $SkipPricing) {
@@ -282,13 +284,14 @@ function Format-Pct {
 
 # ----- Subscription resolution + SKU availability lookup -------------------
 # Resolve target subscriptions:
-#   - If -Subscription was supplied, look each up by Name then by Id
+#   - If -SubscriptionId was supplied, look each up by Id (IDs are globally
+#     unique, so this is unambiguous - unlike display names)
 #   - Else use current Az context (or a single empty placeholder if Az is
 #     unavailable, so the script still produces pricing-only rows)
 # Each emitted row carries SubscriptionName/Id so multi-sub diffs are visible.
 #
 # Availability is the ONLY subscription-scoped data. When -SkipAvailability is
-# set, pricing is identical across subscriptions, so any -Subscription input is
+# set, pricing is identical across subscriptions, so any -SubscriptionId input is
 # ignored and we collapse to a single subscription (current context, or a
 # placeholder) to avoid emitting duplicate pricing rows.
 $subs = [System.Collections.Generic.List[hashtable]]::new()
@@ -300,33 +303,37 @@ try {
     Write-Verbose "Az.Accounts not available: $($_.Exception.Message)"
 }
 
-if ($SkipAvailability -and $Subscription.Count -gt 0) {
-    Write-Warning "-Subscription is ignored with -SkipAvailability (subscription scope only affects availability); pricing is identical across subscriptions, so a single row set is produced."
+if ($SkipAvailability -and $SubscriptionId.Count -gt 0) {
+    Write-Warning "-SubscriptionId is ignored with -SkipAvailability (subscription scope only affects availability); pricing is identical across subscriptions, so a single row set is produced."
 }
 
-if ($Subscription.Count -gt 0 -and -not $SkipAvailability) {
+if ($SubscriptionId.Count -gt 0 -and -not $SkipAvailability) {
     if (-not $azAvailable) {
-        Write-Warning "-Subscription specified but Az module not available. Install Az.Accounts and Connect-AzAccount."
+        Write-Warning "-SubscriptionId specified but Az module not available. Install Az.Accounts and Connect-AzAccount."
     } else {
-        foreach ($s in $Subscription) {
+        foreach ($id in $SubscriptionId) {
+            if ($subs | Where-Object { $_.Id -eq $id }) { continue }   # skip duplicate ids
             $resolved = $null
-            try { $resolved = Get-AzSubscription -SubscriptionName $s -ErrorAction Stop }
-            catch { Write-Verbose "No subscription matched by name '$s': $($_.Exception.Message)" }
-            if (-not $resolved) {
-                try { $resolved = Get-AzSubscription -SubscriptionId $s -ErrorAction Stop }
-                catch { Write-Verbose "No subscription matched by id '$s': $($_.Exception.Message)" }
-            }
+            try { $resolved = Get-AzSubscription -SubscriptionId $id -ErrorAction Stop }
+            catch { Write-Verbose "No subscription matched by id '$id': $($_.Exception.Message)" }
             if ($resolved) {
                 $subs.Add(@{ Name = $resolved.Name; Id = $resolved.Id })
             } else {
-                Write-Warning "Subscription not found / not accessible: $s"
+                Write-Warning "Subscription not found / not accessible: $id"
             }
         }
     }
 }
 
 if ($subs.Count -eq 0) {
-    # Fall back to current context, or a single empty placeholder
+    # Explicit -SubscriptionId was supplied but none resolved: never silently
+    # fall back to the current context, which would attribute subscription-scoped
+    # availability data to the wrong subscription. Fail loudly instead.
+    if ($SubscriptionId.Count -gt 0 -and -not $SkipAvailability) {
+        throw "None of the specified subscription IDs could be resolved or accessed: $($SubscriptionId -join ', '). Check the IDs and your Az login (Connect-AzAccount)."
+    }
+    # No -SubscriptionId specified: fall back to current context, or a single
+    # empty placeholder (so pricing-only runs still produce rows).
     if ($azAvailable) {
         try {
             $ctx = Get-AzContext -ErrorAction Stop
@@ -821,7 +828,7 @@ if (-not $SkipPricing) {
 $sorted = @($rows | Sort-Object SubscriptionName, Region, VmSize, OS)
 
 # Show sub columns when we have a real sub (resolved Az context or explicit
-# -Subscription). Skip them in the pricing-only fallback where no sub identity
+# -SubscriptionId). Skip them in the pricing-only fallback where no sub identity
 # was resolved, and always under -SkipAvailability (where subscription scope is
 # irrelevant and collapsed to a single row set).
 $showSubCols = (-not $SkipAvailability) -and (($subs.Count -gt 1) -or ($subs[0].Id -ne ''))
@@ -856,7 +863,7 @@ if ($sorted.Count -eq 0) {
     Write-Host 'No pricing data returned. Check region names and SKU names (e.g. Standard_D2s_v5) and try again.' -ForegroundColor Red
 } else {
     # Show sub columns when we have a real sub (resolved Az context or
-    # explicit -Subscription). Skip them in the pricing-only fallback where no
+    # explicit -SubscriptionId). Skip them in the pricing-only fallback where no
     # sub identity was resolved, and always under -SkipAvailability (where
     # subscription scope is irrelevant and collapsed to a single row set).
     $cols = @()
