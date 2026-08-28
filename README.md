@@ -93,7 +93,7 @@ CSV); all other parameters are optional.
 | `-IncludeSpot` | `switch` | Include Spot pricing. Spot is highly variable; the API returns the current published rate at query time. |
 | `-IncludeWindows` | `switch` | Add Windows-licensed rows alongside Linux. Windows rows bundle the Windows Server license premium (not discounted by RI/SP). |
 | `-HoursPerMonth` | `int` | Hours used to project hourly rates into monthly costs. Default `730` (Azure billing convention: 365.25 × 24 / 12). |
-| `-ACD` | `double` | All-up customer discount percentage (0–100) applied to the PAYGO rate to reflect EA/MCA negotiated pricing. RI/SP rates are unchanged; Save% is recalculated against the discounted baseline. Default `0`. |
+| `-ACD` | `double` | All-up customer discount percentage (0–100) applied to the PAYGO rate to reflect EA/MCA negotiated pricing. Applies to the entire PAYGO rate, including the Windows license premium. RI/SP compute rates are unchanged, but because the Windows license bills at PAYGO, ACD discounts it there too; Save% is recalculated against the discounted baseline. Default `0`. **Note:** this is a single flat discount applied uniformly — it does not model SKU-level or product-specific negotiated discounts (see [Notes & caveats](#notes--caveats)). |
 | `-InstanceCount` | `int` | Multiply all monthly cost columns by this count to project an N-instance deployment. Save% is unaffected. Default `1`. |
 | `-Currency` | `string` | ISO currency code (e.g. `USD`, `EUR`, `GBP`, `AUD`) passed to the Retail Prices API. All monetary columns are expressed in this currency. Default `USD`. |
 | `-OutputCsv` | `string` | Optional path to export results as a CSV file. |
@@ -189,7 +189,9 @@ thousands separators.
 - **Save%** = saving vs the same-OS PAYGO monthly figure (positive = cheaper
   than PAYGO).
 - For Windows rows, RI/SP reuse the OS-agnostic Linux compute rate and add the
-  Windows license delta at PAYGO rates — matching how Azure actually bills.
+  Windows license delta on top — a commitment discounts compute only, so the
+  license bills at PAYGO. `-ACD`, being a PAYGO discount, therefore reduces that
+  license portion too, even though RI/SP do not.
 
 ### CSV export
 
@@ -200,7 +202,7 @@ run-context fields (`Currency`, `SpotIncluded`, `WindowsLicenseIncluded`,
 
 ## How it works
 
-- **Regions are queried in parallel** (default up to 5 concurrent threads via
+- **Regions are queried in parallel** (default is 5 concurrent threads via
   `-ThrottleLimit`) for both availability and pricing.
 - **A single ARM bearer token** is acquired up front and reused across every
   parallel runspace, avoiding per-subscription context serialization.
@@ -208,8 +210,6 @@ run-context fields (`Currency`, `SpotIncluded`, `WindowsLicenseIncluded`,
   (PAYGO/Spot/Savings Plan) and Reservation records, halving API calls.
 - **Region names are validated** against `Get-AzLocation` before querying, and
   invalid names are pruned with a warning (when Az is available).
-- **SKU names are canonicalized** to the correct case, because the Retail API's
-  `armSkuName` filter is case-sensitive server-side.
 - **Post-run diagnostics** warn about regions that returned no data, unknown
   SKUs, per-region availability gaps, and SKUs with no published commitment
   pricing.
@@ -218,11 +218,17 @@ run-context fields (`Currency`, `SpotIncluded`, `WindowsLicenseIncluded`,
 
 - Pricing is **list price** unless `-ACD` is supplied. Even then, only PAYGO is
   discounted — RI/SP are always list.
+- > **`-ACD` is a single flat discount only.** It applies one uniform percentage
+  > to every PAYGO rate in the run. Some customers negotiate **SKU-level or
+  > product-specific discounts** (e.g. a deeper discount on a particular VM
+  > family or region) that differ from their all-up rate — those are **not**
+  > modeled here. Treat ACD output as an approximation and confirm SKU-specific
+  > pricing with your account team or via Cost Management in the Azure portal.
 - **Azure Hybrid Benefit (AHB)** users should ignore Windows rows and use the
-  Linux rows plus their own AHB-licensed pricing.
+  Linux rows which exclude licensing costs.
 - Spot rates fluctuate; the reported value is a point-in-time snapshot.
 - Availability and restrictions are **subscription-scoped**. Pass one or more
-  `-SubscriptionId` (GUIDs) to evaluate specific subscriptions; when omitted the
+  `-SubscriptionId` to evaluate specific subscriptions; when omitted the
   current Az context is used. Unresolvable IDs are warned and skipped, and if
   *none* of the specified IDs resolve the run stops with an error rather than
   silently falling back to your current context.

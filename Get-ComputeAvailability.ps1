@@ -41,8 +41,10 @@
     PRICING SCOPE: Linux compute by default. SQL / Red Hat / other ISV license
     premiums are NEVER included. Pass -IncludeWindows to add a second row per
     SKU/region showing Windows compute rates (Linux base + Windows license).
-    RIs and Savings Plans do NOT discount the OS license portion - the license
-    component is billed at PAYGO rates even under commitments. Reported Save%
+    RIs and Savings Plans discount the COMPUTE portion only - the OS license
+    premium is never reduced by a commitment and bills at PAYGO rates. An ACD
+    discount, if supplied, still applies to that license portion (because it
+    bills at PAYGO), even though the RI/SP commitment does not. Reported Save%
     is always relative to the SAME-OS PAYGO baseline.
 
     All output is monthly. HoursPerMonth (default 730) is used to project Spot,
@@ -89,9 +91,18 @@
 .PARAMETER ACD
     All-up customer discount percentage (0-100) to apply to the PAYGO rate.
     Use this to reflect EA/MCA negotiated discounts that lower your effective
-    pay-as-you-go rate. RI and SP rates are NOT adjusted; Save% values are
-    recalculated against the discounted PAYGO so commitment savings reflect
-    your real baseline. Default 0 (list price).
+    pay-as-you-go rate. It applies to the ENTIRE PAYGO rate, including the
+    Windows license premium on Windows rows. RI and SP compute rates are NOT
+    adjusted (those are already committed discounts), but the Windows license
+    portion added on top of them bills at PAYGO, so ACD discounts it there too.
+    Save% values are recalculated against the discounted PAYGO so commitment
+    savings reflect your real baseline. Default 0 (list price).
+
+    NOTE: This is a single flat discount applied uniformly to every PAYGO rate.
+    It does NOT model SKU-level or product-specific negotiated discounts (e.g. a
+    deeper discount on a specific VM family or region) that some customers have.
+    Treat the discounted figures as an approximation and confirm SKU-specific
+    pricing with your account team.
 
 .PARAMETER InstanceCount
     Multiply all monthly cost columns by this count to project an N-instance
@@ -231,39 +242,6 @@ if ($VmSize.Count -eq 0) {
 if ($Region.Count -eq 0) {
     throw 'No regions specified. Provide -Region and/or -RegionCsv.'
 }
-
-Write-Host ''
-Write-Host '================================================================' -ForegroundColor Cyan
-Write-Host '  Azure Virtual Machine Availability + Price Comparison' -ForegroundColor Cyan
-Write-Host "  Regions        : $($Region -join ', ')" -ForegroundColor Cyan
-Write-Host "  VM Sizes       : $($VmSize -join ', ')" -ForegroundColor Cyan
-if ($SubscriptionId -and -not $SkipAvailability) { Write-Host "  Subscriptions  : $($SubscriptionId -join ', ')" -ForegroundColor Cyan }
-# Spot / license / hours / discount / instance options only affect pricing output,
-# and the licensing NOTE with them; hide the whole group when pricing is skipped.
-if (-not $SkipPricing) {
-    Write-Host "  Spot           : $(if ($IncludeSpot) { 'included' } else { 'excluded' })" -ForegroundColor Cyan
-    Write-Host "  WindowsLicense : $(if ($IncludeWindows) { 'included (license bundled)' } else { 'excluded' })" -ForegroundColor Cyan
-    Write-Host "  Hours/Mo       : $HoursPerMonth" -ForegroundColor Cyan
-    Write-Host "  Currency       : $Currency" -ForegroundColor Cyan
-    if ($ACD -gt 0) { Write-Host "  ACD            : -$ACD% applied to PAYGO" -ForegroundColor Cyan }
-    if ($InstanceCount -gt 1) { Write-Host "  Instances      : x$InstanceCount" -ForegroundColor Cyan }
-    Write-Host '' -ForegroundColor Cyan
-    if ($IncludeWindows) {
-        Write-Host '  NOTE: Windows rows bundle the Windows Server license premium.' -ForegroundColor Yellow
-        Write-Host '        RIs and Savings Plans do NOT discount the OS license portion -' -ForegroundColor Yellow
-        Write-Host '        only the underlying compute. SQL / other ISV licenses excluded.' -ForegroundColor Yellow
-        Write-Host '        Azure Hybrid Benefit (AHB) users: ignore Windows rows and use Linux.' -ForegroundColor Yellow
-    } else {
-        Write-Host '  NOTE: Prices do NOT include Windows / SQL / other OS license costs.' -ForegroundColor Yellow
-        Write-Host '        Reservations and Savings Plans only discount the compute portion.' -ForegroundColor Yellow
-        Write-Host '        Use -IncludeWindows to add Windows-licensed pricing rows.' -ForegroundColor Yellow
-    }
-}
-# Run-mode status is unrelated to the pricing inputs above; keep it at the bottom.
-if ($SkipPricing)      { Write-Host '  Pricing        : skipped (availability-only)' -ForegroundColor Cyan }
-if ($SkipAvailability) { Write-Host '  Availability   : skipped (pricing-only)' -ForegroundColor Cyan }
-Write-Host '================================================================' -ForegroundColor Cyan
-Write-Host ''
 
 $rows = [System.Collections.Concurrent.ConcurrentBag[pscustomobject]]::new()
 
@@ -547,6 +525,46 @@ if ($azAvailable -and ($subs[0].Id -ne '')) {
     }
 }
 
+# ----- Run summary header --------------------------------------------------
+# Printed here (after region validation + SKU canonicalization) so the Regions
+# and VM Sizes lines reflect the normalized/canonical casing actually queried,
+# not the raw case the caller typed.
+Write-Host ''
+Write-Host '================================================================' -ForegroundColor Cyan
+Write-Host '  Azure Virtual Machine Availability + Price Comparison' -ForegroundColor Cyan
+Write-Host "  Regions        : $($Region -join ', ')" -ForegroundColor Cyan
+Write-Host "  VM Sizes       : $($VmSize -join ', ')" -ForegroundColor Cyan
+if ($SubscriptionId -and -not $SkipAvailability) { Write-Host "  Subscriptions  : $($SubscriptionId -join ', ')" -ForegroundColor Cyan }
+# Spot / license / hours / discount / instance options only affect pricing
+# output; hide the whole group when pricing is skipped.
+if (-not $SkipPricing) {
+    Write-Host "  Spot           : $(if ($IncludeSpot) { 'included' } else { 'excluded' })" -ForegroundColor Cyan
+    Write-Host "  WindowsLicense : $(if ($IncludeWindows) { 'included (license bundled)' } else { 'excluded' })" -ForegroundColor Cyan
+    Write-Host "  Hours/Mo       : $HoursPerMonth" -ForegroundColor Cyan
+    Write-Host "  Currency       : $Currency" -ForegroundColor Cyan
+    if ($ACD -gt 0) { Write-Host "  ACD            : -$ACD% applied to PAYGO" -ForegroundColor Cyan }
+    if ($InstanceCount -gt 1) { Write-Host "  Instances      : x$InstanceCount" -ForegroundColor Cyan }
+}
+# Run-mode status is unrelated to the pricing inputs above; keep it at the bottom.
+if ($SkipPricing)      { Write-Host '  Pricing        : skipped (availability-only)' -ForegroundColor Cyan }
+if ($SkipAvailability) { Write-Host '  Availability   : skipped (pricing-only)' -ForegroundColor Cyan }
+# Licensing NOTE sits below the main block so the run summary stays compact.
+if (-not $SkipPricing) {
+    Write-Host '' -ForegroundColor Cyan
+    if ($IncludeWindows) {
+        Write-Host '  NOTE: Windows rows bundle the Windows Server license premium.' -ForegroundColor Yellow
+        Write-Host '        RIs and Savings Plans do NOT discount the OS license portion -' -ForegroundColor Yellow
+        Write-Host '        only the underlying compute. SQL / other ISV licenses excluded.' -ForegroundColor Yellow
+        Write-Host '        Azure Hybrid Benefit (AHB) users: ignore Windows rows and use Linux.' -ForegroundColor Yellow
+    } else {
+        Write-Host '  NOTE: Prices do NOT include Windows / SQL / other OS license costs.' -ForegroundColor Yellow
+        Write-Host '        Reservations and Savings Plans only discount the compute portion.' -ForegroundColor Yellow
+        Write-Host '        Use -IncludeWindows to add Windows-licensed pricing rows.' -ForegroundColor Yellow
+    }
+}
+Write-Host '================================================================' -ForegroundColor Cyan
+Write-Host ''
+
 # ---------------------------------------------------------------------------
 Write-Progress -Activity 'Querying regions' -Status "$($Region.Count) region(s)..."
 
@@ -673,15 +691,17 @@ $Region | ForEach-Object -Parallel {
 
             # Reserved Instance / Savings Plan:
             # The Retail API publishes ONE OS-agnostic RI/SP entry per SKU (under the
-            # Linux product line). The Windows license premium is NEVER discounted by
-            # a commitment - it bills at PAYGO rates regardless. So for Windows rows
-            # we reuse the Linux RI/SP compute rate and add the Windows license delta
-            # (= Windows_PAYGO - Linux_PAYGO) at PAYGO, which matches real billing.
+            # Linux product line). A commitment discounts COMPUTE ONLY - the Windows
+            # license premium is never reduced by RI/SP and bills at PAYGO. So for
+            # Windows rows we reuse the Linux RI/SP compute rate and add the Windows
+            # license delta (= Windows_PAYGO - Linux_PAYGO) on top. That license
+            # portion bills at PAYGO, so ACD (a PAYGO discount) DOES apply to it,
+            # even though the RI/SP commitment does not.
             $baseRiPayg = if ($os -eq 'Windows') { $consIndex["$sku|Linux|PAYGO"] } else { $payg }
             $ri1Total   = $riIndex["$sku|Linux|1 Year"]
             $ri3Total   = $riIndex["$sku|Linux|3 Years"]
             $licenseDeltaHr = if ($os -eq 'Windows' -and $baseRiPayg) { $payg.Rate - $baseRiPayg.Rate } else { 0 }
-            $licenseMo      = $licenseDeltaHr * $hoursPerMo * $instCount   # PAYGO; no ACD on license premium
+            $licenseMo      = $licenseDeltaHr * $hoursPerMo * $acdMult * $instCount   # license bills at PAYGO; ACD applies, RI/SP do not
 
             $ri1Mo = if ($null -ne $ri1Total) { (($ri1Total / 12) * $instCount) + $licenseMo } else { $null }
             $ri3Mo = if ($null -ne $ri3Total) { (($ri3Total / 36) * $instCount) + $licenseMo } else { $null }
