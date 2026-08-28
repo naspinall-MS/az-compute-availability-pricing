@@ -291,6 +291,28 @@ function Resolve-VmSizeExistence {
     return ,$existing
 }
 
+function Test-RetailRegionHasVm {
+    # Anonymous existence check: does this region publish ANY Virtual Machines
+    # consumption pricing? Every real Azure region does; an invalid region name
+    # returns nothing. Lets us tell a typo'd region from a valid region that
+    # merely has no matching sizes, when Az-based region validation is
+    # unavailable (e.g. signed out). On error we assume valid to avoid false
+    # "invalid region" claims.
+    param(
+        [Parameter(Mandatory)][string]$Region,
+        [Parameter(Mandatory)][string]$Currency
+    )
+    $filter = "serviceName eq 'Virtual Machines' and armRegionName eq '$Region' and priceType eq 'Consumption'"
+    $uri    = "https://prices.azure.com/api/retail/prices?api-version=2023-01-01-preview&currencyCode=$Currency&`$filter=$([Uri]::EscapeDataString($filter))"
+    try {
+        $page = Invoke-RestMethod -Uri $uri -Method Get -ErrorAction Stop
+        return [bool]($page.Items -and $page.Items.Count -gt 0)
+    } catch {
+        Write-Verbose "Region existence probe failed for '$Region': $($_.Exception.Message)"
+        return $true
+    }
+}
+
 # ----- Subscription resolution + SKU availability lookup -------------------
 # Resolve target subscriptions:
 #   - If -SubscriptionId was supplied, look each up by Id (IDs are globally
@@ -410,6 +432,14 @@ if ($azAvailable -and ($subs[0].Id -ne '')) {
 # concurrency the pricing block enjoys.
 $availMap        = @{}
 $availAvailable  = $false
+# Sub/region pairs whose availability lookup failed (e.g. 401). Rows for these
+# render '?' (unknown) instead of a misleading 'Unavailable'. Defined at main
+# scope so the pricing loop can consume it even when availability is skipped.
+$availFailed        = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+# Shown-once guard: the first 401 suggests Connect-AzAccount (likely a stale
+# token); repeat 401s are treated as a genuine scope-authorization problem and
+# do NOT re-suggest reconnecting.
+$reconnectHintShown = $false
 if (-not $SkipAvailability) {
     try {
         if (-not $azAvailable) { throw 'Az.Accounts not available; run Connect-AzAccount.' }
@@ -433,6 +463,7 @@ if (-not $SkipAvailability) {
         if ($workItems.Count -gt 0) {
             Write-Progress -Activity 'SKU availability lookup' -Status "$($workItems.Count) subscription/region pair(s)..."
             $availResults = [System.Collections.Concurrent.ConcurrentBag[hashtable]]::new()
+            $availFailures = [System.Collections.Concurrent.ConcurrentBag[hashtable]]::new()
             $vmSizeSet    = [System.Collections.Generic.HashSet[string]]::new(
                 [string[]]$VmSize, [System.StringComparer]::OrdinalIgnoreCase)
 
@@ -441,6 +472,7 @@ if (-not $SkipAvailability) {
                 $token    = $using:armToken
                 $skuSet   = $using:vmSizeSet
                 $bag      = $using:availResults
+                $failBag  = $using:availFailures
 
                 $filter = "location eq '$($item.Region)'"
                 $uri    = "https://management.azure.com/subscriptions/$($item.SubId)/providers/Microsoft.Compute/skus?api-version=2021-07-01&`$filter=$([Uri]::EscapeDataString($filter))"
@@ -453,7 +485,20 @@ if (-not $SkipAvailability) {
                         $uri = if ($resp.PSObject.Properties['nextLink'] -and $resp.nextLink) { $resp.nextLink } else { $null }
                     } while ($uri)
                 } catch {
-                    Write-Warning "Availability lookup failed (sub: $($item.SubName), region: $($item.Region)): $($_.Exception.Message)"
+                    # Capture the HTTP status (if any) so the main thread can
+                    # apply the reconnect-once rule; parallel runspaces can't
+                    # coordinate a shared 'already warned' flag deterministically.
+                    $status = 0
+                    if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
+                        try { $status = [int]$_.Exception.Response.StatusCode } catch { $status = 0 }
+                    }
+                    $failBag.Add(@{
+                        SubId   = $item.SubId
+                        SubName = $item.SubName
+                        Region  = $item.Region
+                        Status  = $status
+                        Message = $_.Exception.Message
+                    })
                     return
                 }
 
@@ -511,6 +556,27 @@ if (-not $SkipAvailability) {
                     ZoneReason      = $entry.ZoneReason
                 }
             }
+
+            # Surface lookup failures from the main thread so the reconnect hint
+            # fires only on the first 401. Every failed pair is recorded so its
+            # rows render '?' rather than a false 'Unavailable'.
+            foreach ($f in $availFailures) { [void]$availFailed.Add("$($f.SubId)|$($f.Region)") }
+            if ($availFailures.Count -gt 0) {
+                $auth401 = @($availFailures | Where-Object { $_.Status -eq 401 })
+                $other   = @($availFailures | Where-Object { $_.Status -ne 401 })
+                foreach ($f in $auth401) {
+                    $scope = "sub: $($f.SubName), region: $($f.Region)"
+                    if (-not $reconnectHintShown) {
+                        Write-Warning "Availability lookup returned 401 Unauthorized ($scope). Your Azure token may be stale - run Connect-AzAccount to refresh, then retry."
+                        $reconnectHintShown = $true
+                    } else {
+                        Write-Warning "Availability lookup returned 401 Unauthorized ($scope) - your account is not authorized for this scope; skipping."
+                    }
+                }
+                foreach ($f in $other) {
+                    Write-Warning "Availability lookup failed (sub: $($f.SubName), region: $($f.Region)): $($f.Message)"
+                }
+            }
             Write-Progress -Activity 'SKU availability lookup' -Completed
         }
         $availAvailable = $true
@@ -522,51 +588,96 @@ if (-not $SkipAvailability) {
 
 # ----- Canonicalize VM SKU names ------------------------------------------
 # The Retail API's armSkuName filter is case-sensitive server-side
-# (armSkuName eq 'standard_d2s_v5' returns zero rows). Normalize user input
-# to canonical case using the ARM SKU catalog. Prefer the availability data
-# we already fetched; fall back to a one-shot ARM call when availability was
-# skipped or empty.
-if ($azAvailable -and ($subs[0].Id -ne '')) {
-    $skuCanonMap = [System.Collections.Generic.Dictionary[string,string]]::new(
-        [System.StringComparer]::OrdinalIgnoreCase)
+# (armSkuName eq 'standard_d2s_v5' returns zero rows), so a valid size typed in
+# the wrong case would silently return no pricing. Normalize user input to
+# canonical case from the best source available, in order:
+#   1. ARM availability data we already fetched (free);
+#   2. a one-shot ARM catalog call (needs a usable Azure context);
+#   3. the ANONYMOUS Retail catalog (works signed-out, so casing is fixed even
+#      with no Azure login / a broken token).
+$skuCanonMap = [System.Collections.Generic.Dictionary[string,string]]::new(
+    [System.StringComparer]::OrdinalIgnoreCase)
 
-    if ($availMap.Count -gt 0) {
-        foreach ($key in $availMap.Keys) {
-            $name = $key.Split('|', 3)[2]
-            if (-not $skuCanonMap.ContainsKey($name)) { $skuCanonMap[$name] = $name }
-        }
-    } elseif (-not $SkipPricing) {
-        # No availability data and pricing is needed - one un-filtered ARM call
-        # against the first valid region just to canonicalize names.
-        try {
-            $tokenResult = Get-AzAccessToken -ResourceUrl 'https://management.azure.com/' -ErrorAction Stop
-            $token = if ($tokenResult.Token -is [System.Security.SecureString]) {
-                [System.Net.NetworkCredential]::new('', $tokenResult.Token).Password
-            } else { [string]$tokenResult.Token }
-            $filter  = "location eq '$($Region[0])'"
-            $uri     = "https://management.azure.com/subscriptions/$($subs[0].Id)/providers/Microsoft.Compute/skus?api-version=2021-07-01&`$filter=$([Uri]::EscapeDataString($filter))"
-            $headers = @{ Authorization = "Bearer $token" }
-            do {
-                $resp = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
-                if ($resp.value) {
-                    foreach ($s in $resp.value) {
-                        if ($s.resourceType -eq 'virtualMachines' -and -not $skuCanonMap.ContainsKey($s.name)) {
-                            $skuCanonMap[$s.name] = $s.name
-                        }
+# 1. From ARM availability data.
+if ($availMap.Count -gt 0) {
+    foreach ($key in $availMap.Keys) {
+        $name = $key.Split('|', 3)[2]
+        if (-not $skuCanonMap.ContainsKey($name)) { $skuCanonMap[$name] = $name }
+    }
+}
+
+# 2. One-shot ARM catalog call (requires a usable Azure context).
+if ($skuCanonMap.Count -eq 0 -and -not $SkipPricing -and $azAvailable -and ($subs[0].Id -ne '')) {
+    try {
+        $tokenResult = Get-AzAccessToken -ResourceUrl 'https://management.azure.com/' -ErrorAction Stop
+        $token = if ($tokenResult.Token -is [System.Security.SecureString]) {
+            [System.Net.NetworkCredential]::new('', $tokenResult.Token).Password
+        } else { [string]$tokenResult.Token }
+        $filter  = "location eq '$($Region[0])'"
+        $uri     = "https://management.azure.com/subscriptions/$($subs[0].Id)/providers/Microsoft.Compute/skus?api-version=2021-07-01&`$filter=$([Uri]::EscapeDataString($filter))"
+        $headers = @{ Authorization = "Bearer $token" }
+        do {
+            $resp = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
+            if ($resp.value) {
+                foreach ($s in $resp.value) {
+                    if ($s.resourceType -eq 'virtualMachines' -and -not $skuCanonMap.ContainsKey($s.name)) {
+                        $skuCanonMap[$s.name] = $s.name
                     }
                 }
-                $uri = if ($resp.PSObject.Properties['nextLink'] -and $resp.nextLink) { $resp.nextLink } else { $null }
-            } while ($uri)
-        } catch {
+            }
+            $uri = if ($resp.PSObject.Properties['nextLink'] -and $resp.nextLink) { $resp.nextLink } else { $null }
+        } while ($uri)
+    } catch {
+        $status = 0
+        if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
+            try { $status = [int]$_.Exception.Response.StatusCode } catch { $status = 0 }
+        }
+        if ($status -eq 401) {
+            if (-not $reconnectHintShown) {
+                Write-Warning "SKU name canonicalization returned 401 Unauthorized. Your Azure token may be stale - run Connect-AzAccount to refresh, then retry."
+                $reconnectHintShown = $true
+            } else {
+                Write-Warning "SKU name canonicalization returned 401 Unauthorized - your account is not authorized for this scope; skipping."
+            }
+        } else {
             Write-Warning "SKU name canonicalization skipped: $($_.Exception.Message)"
         }
     }
+}
 
-    if ($skuCanonMap.Count -gt 0) {
-        $VmSize = @($VmSize | ForEach-Object {
-            if ($skuCanonMap.ContainsKey($_)) { $skuCanonMap[$_] } else { $_ }
-        })
+# 3. Anonymous Retail catalog fallback (no Azure login required). Pull the VM
+#    consumption catalog for the first region that returns data and use it to
+#    fix casing. Bounded page count so a bad filter can't loop unbounded.
+if ($skuCanonMap.Count -eq 0 -and -not $SkipPricing) {
+    foreach ($probeRegion in $Region) {
+        try {
+            $catFilter = "serviceName eq 'Virtual Machines' and armRegionName eq '$probeRegion' and priceType eq 'Consumption'"
+            $catUri    = "https://prices.azure.com/api/retail/prices?api-version=2023-01-01-preview&currencyCode=$Currency&`$filter=$([Uri]::EscapeDataString($catFilter))"
+            $catPages  = 0
+            do {
+                $catPage = Invoke-RestMethod -Uri $catUri -Method Get -ErrorAction Stop
+                if ($catPage.Items) {
+                    foreach ($ci in $catPage.Items) {
+                        if ($ci.armSkuName -and -not $skuCanonMap.ContainsKey($ci.armSkuName)) {
+                            $skuCanonMap[$ci.armSkuName] = $ci.armSkuName
+                        }
+                    }
+                }
+                $catUri = if ($catPage.PSObject.Properties['NextPageLink'] -and $catPage.NextPageLink) { $catPage.NextPageLink } else { $null }
+                $catPages++
+            } while ($catUri -and $catPages -lt 25)
+        } catch {
+            Write-Warning "SKU name canonicalization skipped (Retail catalog for '$probeRegion'): $($_.Exception.Message)"
+        }
+        if ($skuCanonMap.Count -gt 0) { break }
     }
+}
+
+# Apply canonical casing to the requested sizes.
+if ($skuCanonMap.Count -gt 0) {
+    $VmSize = @($VmSize | ForEach-Object {
+        if ($skuCanonMap.ContainsKey($_)) { $skuCanonMap[$_] } else { $_ }
+    })
 }
 
 # ----- Run summary header --------------------------------------------------
@@ -623,6 +734,7 @@ $Region | ForEach-Object -Parallel {
     $instCount    = $using:InstanceCount
     $availMap     = $using:availMap
     $availOn      = $using:availAvailable
+    $availFailedSet = $using:availFailed
     $subs         = $using:subs
     $rowsBag      = $using:rows
     $currency     = $using:Currency
@@ -769,6 +881,14 @@ $Region | ForEach-Object -Parallel {
         $restriction   = '?'
         $regionBlocked = $false
         if ($availOn -and $sub.Id) {
+          if ($availFailedSet.Contains("$($sub.Id)|$region")) {
+            # The availability lookup for this subscription/region failed (e.g.
+            # 401 Unauthorized), so we genuinely don't know - report unknown ('?')
+            # rather than asserting a false 'Unavailable'.
+            $regionAvail = '?'
+            $zoneAvail   = '?'
+            $restriction = 'Availability lookup failed.'
+          } else {
             $info = $availMap["$($sub.Id)|$region|$sku"]
             if ($info) {
                 # Column 1: the SKU is listed (offered) in the region.
@@ -794,6 +914,7 @@ $Region | ForEach-Object -Parallel {
                 $zoneAvail   = 'Unavailable'
                 $restriction = 'VM size not available in region.'
             }
+          }
         }
 
         $rowsBag.Add([pscustomobject]@{
@@ -839,11 +960,19 @@ foreach ($r in $rows) {
 # region just means none of the requested VM sizes matched there - which the
 # VM-size diagnostics below explain - so we don't blame the (valid) region.
 if ($regionsValidated) {
+    # Names already confirmed against the Azure catalog upstream.
     $badRegions = @()
 } else {
-    $badRegions = @($Region | Where-Object { -not $regionsWithData.Contains($_) })
+    # Az validation was unavailable (e.g. signed out). A no-data region is
+    # either an invalid name or a valid region whose requested sizes aren't
+    # offered. Use the anonymous Retail catalog to tell them apart, and only
+    # exclude genuinely-invalid names - valid-but-empty regions stay in the set
+    # so the VM-size diagnostics below can explain them instead of blaming the
+    # region.
+    $noDataRegions = @($Region | Where-Object { -not $regionsWithData.Contains($_) })
+    $badRegions    = @($noDataRegions | Where-Object { -not (Test-RetailRegionHasVm -Region $_ -Currency $Currency) })
     if ($badRegions) {
-        Write-Warning "No data returned for region(s): $($badRegions -join ', ') - the name may be invalid or the pricing API returned nothing."
+        Write-Warning "Unknown or invalid region name(s): $($badRegions -join ', ')"
     }
 }
 
@@ -855,6 +984,24 @@ $skuMissingIn = @{}
 foreach ($s in $VmSize) {
     $missing = @($queryRegions | Where-Object { -not $received.Contains("$_|$s") })
     if ($missing.Count -gt 0) { $skuMissingIn[$s] = $missing }
+}
+
+# ARM subscription-level availability (Microsoft.Compute/skus) is authoritative
+# for whether a size is REAL, independent of Retail pricing. Brand-new / preview
+# SKUs are often offered (and visible here) before their pricing meters
+# propagate to the Retail API, so this map rescues them from being mislabeled as
+# typos. Keyed sku -> set of queried regions where ARM reports it. Empty under
+# -SkipAvailability (no ARM lookup ran).
+$availSkuRegions = [System.Collections.Generic.Dictionary[string,System.Collections.Generic.HashSet[string]]]::new(
+    [System.StringComparer]::OrdinalIgnoreCase)
+foreach ($k in $availMap.Keys) {
+    $parts = $k.Split('|', 3)
+    if ($parts.Count -lt 3) { continue }
+    $kRegion = $parts[1]; $kSku = $parts[2]
+    if (-not $availSkuRegions.ContainsKey($kSku)) {
+        $availSkuRegions[$kSku] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    }
+    [void]$availSkuRegions[$kSku].Add($kRegion)
 }
 
 # VM sizes absent from EVERY queried region are ambiguous: a genuine typo, or a
@@ -875,11 +1022,22 @@ foreach ($s in $VmSize) {
     if (-not $skuMissingIn.ContainsKey($s)) { continue }   # present in every queried region
     $missing = $skuMissingIn[$s]
     if ($queryRegions.Count -gt 0 -and $missing.Count -eq $queryRegions.Count) {
-        # Missing everywhere we queried.
-        if ($existsGlobally.Contains($s)) {
+        # Missing everywhere we queried. Rank the evidence: ARM availability is
+        # the strongest signal a size is real (covers new/preview SKUs whose
+        # pricing meters haven't propagated), then a global Retail hit, then typo.
+        $availHere = if ($availSkuRegions.ContainsKey($s)) {
+            @($queryRegions | Where-Object { $availSkuRegions[$s].Contains($_) })
+        } else { @() }
+
+        if ($availHere.Count -gt 0) {
+            Write-Warning "VM size '$s' is available in region(s): $($availHere -join ', ') but has no published pricing yet - likely a new/preview SKU whose meters have not propagated to the Retail API."
+        } elseif ($existsGlobally.Contains($s)) {
             Write-Warning "VM size '$s' is a valid Azure size but is not offered in the selected region(s): $($missing -join ', '). Pick a region where it is available."
+        } elseif ($availSkuRegions.ContainsKey($s)) {
+            # ARM knows the size but not in the specific queried regions - still real, not a typo.
+            Write-Warning "VM size '$s' is a valid Azure size but is not offered / priced in the selected region(s): $($missing -join ', ')."
         } elseif (-not $SkipPricing) {
-            Write-Warning "Unknown VM size (not found in the Azure retail catalog): $s - check for typos (names are case-sensitive, e.g. Standard_D2s_v5)."
+            Write-Warning "Unknown VM size (not found in the Azure retail catalog): $s - check for typos (e.g. Standard_D2s_v5)."
             $unknownSkus.Add($s)
         } else {
             Write-Warning "VM size '$s' returned no availability data in the selected region(s): $($missing -join ', ')."
@@ -893,7 +1051,7 @@ foreach ($s in $VmSize) {
 # Mirror the all-regions-invalid behavior: if EVERY requested VM size is an
 # unknown name, stop hard rather than exiting quietly with an empty table.
 if ($queryRegions.Count -gt 0 -and $VmSize.Count -gt 0 -and $unknownSkus.Count -eq $VmSize.Count) {
-    throw "None of the specified VM sizes are valid Azure VM size names: $($unknownSkus -join ', '). Check for typos (names are case-sensitive, e.g. Standard_D2s_v5)."
+    throw "None of the specified VM sizes are valid Azure VM size names: $($unknownSkus -join ', '). Check for typos (e.g. Standard_D2s_v5)."
 }
 
 # Commitment-pricing gaps: for each SKU present in the results, identify which

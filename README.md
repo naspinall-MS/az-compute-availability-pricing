@@ -165,9 +165,9 @@ One row per subscription × region × VM size (× OS when `-IncludeWindows` is s
 | `SubscriptionName` / `SubscriptionId` | The subscription the row applies to (shown only when a real subscription is resolved). |
 | `Region` / `VmSize` | The ARM region and SKU. |
 | `OS` | `Linux` or `Windows` (only shown with `-IncludeWindows`). |
-| `RegionAvailability` | `Available` (SKU listed/offered in the region) or `Unavailable` (not listed); `?` when the lookup is skipped/unavailable. |
+| `RegionAvailability` | `Available` (SKU listed/offered in the region) or `Unavailable` (not listed); `?` when the lookup is skipped, unavailable, or failed for that subscription/region (e.g. a 401). |
 | `ZoneAvailability` | Zones the SKU is offered in for the region (e.g. `1,2,3`). `N/A` for a non-zonal region, `Unavailable` when the SKU is not listed, or `?`. |
-| `Restrictions` | `None`, the restriction detail (`Region` for a subscription-level block and/or `Zone 1,2,3` for blocked zones), or `VM size not available in region.` when the SKU is not listed. A restriction means the size is offered but blocked for your subscription; unblock via a support case. `?` when the lookup is unavailable. |
+| `Restrictions` | `None`, the restriction detail (`Region` for a subscription-level block and/or `Zone 1,2,3` for blocked zones), `VM size not available in region.` when the SKU is not listed, or `Availability lookup failed.` when the per-subscription/region lookup errored (shown as `?` rather than a false negative). A restriction means the size is offered but blocked for your subscription; unblock via a support case. `?` when the lookup is unavailable. |
 | `PAYGO/Mo` | Pay-as-you-go monthly cost. Header shows `(-N%)` when `-ACD` is applied. |
 | `Spot/Mo` / `Spot%` | Spot monthly cost and saving vs PAYGO (with `-IncludeSpot`). |
 | `RI1Yr/Mo` / `RI1Yr%` | Reserved Instance 1-year monthly cost and saving. |
@@ -215,12 +215,17 @@ run-context fields (`Currency`, `SpotIncluded`, `WindowsLicenseIncluded`,
   the region:
   - present in some regions but missing in others → *regional availability gap*
     (warns, naming only the missing regions);
+  - available per subscription-level availability but with no pricing rows →
+    *valid size, pricing not published yet* (e.g. a brand-new or preview family
+    whose Retail meters haven't propagated), reported as available-but-unpriced
+    rather than as a typo (warns; exit 0);
   - missing from every selected region but confirmed to exist elsewhere via a
     region-agnostic Retail probe → *valid size, just not offered in the selected
     region(s)* (warns; exit 0);
-  - missing everywhere and not found in the Retail catalog → *unknown/typo name*
-    (warns). If **every** requested VM size is unknown, the run stops with an
-    error (mirroring the all-invalid-regions behavior).
+  - missing everywhere and not found in either subscription availability or the
+    Retail catalog → *unknown/typo name* (warns). If **every** requested VM size
+    is unknown, the run stops with an error (mirroring the all-invalid-regions
+    behavior).
 - **SKUs with no published commitment pricing** (e.g. some specialty families
   without RI/Savings Plan rates) are also flagged.
 
