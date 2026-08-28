@@ -126,8 +126,8 @@ CSV); all other parameters are optional.
 # Fast pricing-only run (skip the ARM availability lookup)
 .\Get-ComputeAvailability.ps1 -Region eastus -VmSize Standard_D2s_v5 -SkipAvailability
 
-# Read SKUs and subscription IDs from CSV files (merged with any inline values)
-.\Get-ComputeAvailability.ps1 -Region eastus,westus2 -VmSizeCsv .\skus.csv -SubscriptionIdCsv .\subs.csv
+# Read regions, SKUs, and subscription IDs from CSV files (merged with any inline values)
+.\Get-ComputeAvailability.ps1 -RegionCsv .\regions.csv -VmSizeCsv .\skus.csv -SubscriptionIdCsv .\subs.csv
 
 # Price in euros and pipe the objects on for further filtering
 .\Get-ComputeAvailability.ps1 -Region westeurope -VmSize Standard_D2s_v5 -Currency EUR -PassThru |
