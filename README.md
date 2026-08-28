@@ -209,10 +209,20 @@ run-context fields (`Currency`, `SpotIncluded`, `WindowsLicenseIncluded`,
 - **One combined Retail API request per region** fetches both Consumption
   (PAYGO/Spot/Savings Plan) and Reservation records, halving API calls.
 - **Region names are validated** against `Get-AzLocation` before querying, and
-  invalid names are pruned with a warning (when Az is available).
-- **Post-run diagnostics** warn about regions that returned no data, unknown
-  SKUs, per-region availability gaps, and SKUs with no published commitment
-  pricing.
+  invalid names are pruned with a warning (when Az is available). If every
+  requested region is invalid, the run stops with an error.
+- **Post-run diagnostics** classify each requested VM size instead of blaming
+  the region:
+  - present in some regions but missing in others → *regional availability gap*
+    (warns, naming only the missing regions);
+  - missing from every selected region but confirmed to exist elsewhere via a
+    region-agnostic Retail probe → *valid size, just not offered in the selected
+    region(s)* (warns; exit 0);
+  - missing everywhere and not found in the Retail catalog → *unknown/typo name*
+    (warns). If **every** requested VM size is unknown, the run stops with an
+    error (mirroring the all-invalid-regions behavior).
+- **SKUs with no published commitment pricing** (e.g. some specialty families
+  without RI/Savings Plan rates) are also flagged.
 
 ## Notes & caveats
 

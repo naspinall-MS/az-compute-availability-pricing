@@ -260,6 +260,37 @@ function Format-Pct {
     return "$Value%"
 }
 
+function Resolve-VmSizeExistence {
+    # Region-agnostic existence probe: query the public Retail Prices API for the
+    # given VM sizes with NO region filter. Any armSkuName that comes back is a
+    # real Azure VM size (offered/priced somewhere), which lets callers tell a
+    # genuine typo from a valid size that simply isn't in the selected regions.
+    param(
+        [Parameter(Mandatory)][string[]]$Sku,
+        [Parameter(Mandatory)][string]$Currency
+    )
+    $existing = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    if ($Sku.Count -eq 0) { return $existing }
+    $skuClause = ($Sku | ForEach-Object { "armSkuName eq '$_'" }) -join ' or '
+    $filter    = "serviceName eq 'Virtual Machines' and priceType eq 'Consumption' and ($skuClause)"
+    $uri       = "https://prices.azure.com/api/retail/prices?api-version=2023-01-01-preview&currencyCode=$Currency&`$filter=$([Uri]::EscapeDataString($filter))"
+    try {
+        do {
+            $page = Invoke-RestMethod -Uri $uri -Method Get -ErrorAction Stop
+            if ($page.Items) {
+                foreach ($it in $page.Items) { [void]$existing.Add($it.armSkuName) }
+            }
+            $uri = if ($page.PSObject.Properties['NextPageLink'] -and $page.NextPageLink) { $page.NextPageLink } else { $null }
+        } while ($uri)
+    } catch {
+        Write-Verbose "VM size existence probe failed: $($_.Exception.Message)"
+    }
+    # Unary comma keeps PowerShell from unrolling the set into the pipeline
+    # (which would turn an empty set into $null and a populated one into a
+    # bare string/array), so the caller always gets the HashSet object back.
+    return ,$existing
+}
+
 # ----- Subscription resolution + SKU availability lookup -------------------
 # Resolve target subscriptions:
 #   - If -SubscriptionId was supplied, look each up by Id (IDs are globally
@@ -330,11 +361,26 @@ if ($subs.Count -eq 0) {
 # region names here avoids wasted Retail API calls and confusing downstream
 # warnings. If Az is unavailable, this step is silently skipped and bad regions
 # will surface later via empty Retail API results.
+#
+# $regionsValidated records whether we authoritatively confirmed the region
+# names against the Azure catalog. Post-run diagnostics use it to decide whether
+# an empty region means a bad region name or simply no matching VM sizes.
+$regionsValidated = $false
 if ($azAvailable -and ($subs[0].Id -ne '')) {
+    # Fetch the region catalog on its own so a Get-AzLocation failure (e.g. the
+    # known Az.Accounts "Value cannot be null. (Parameter 'g')" when the context
+    # is in a bad state) degrades to a warning and skips validation, rather than
+    # aborting the run. Bad region names then surface later as empty results.
+    $validRegions = $null
     try {
-        # Build case-insensitive canonical-name map: lowercased input -> canonical
         $validRegions = (Get-AzLocation -ErrorAction Stop).Location
-        $canonMap     = [System.Collections.Generic.Dictionary[string,string]]::new(
+    } catch {
+        Write-Warning "Region validation skipped: $($_.Exception.Message)"
+    }
+
+    if ($validRegions) {
+        # Build case-insensitive canonical-name map: input -> canonical
+        $canonMap = [System.Collections.Generic.Dictionary[string,string]]::new(
             [System.StringComparer]::OrdinalIgnoreCase)
         foreach ($v in $validRegions) { $canonMap[$v] = $v }
 
@@ -348,13 +394,11 @@ if ($azAvailable -and ($subs[0].Id -ne '')) {
             ForEach-Object { $canonMap[$_] } |
             Select-Object -Unique)
 
+        # Fatal only when the catalog loaded but pruned every requested region.
         if ($Region.Count -eq 0) {
             throw 'No valid regions remain after validation. Use Get-AzLocation to see available region names.'
         }
-    } catch [System.Management.Automation.RuntimeException] {
-        throw
-    } catch {
-        Write-Warning "Region validation skipped: $($_.Exception.Message)"
+        $regionsValidated = $true
     }
 }
 
@@ -781,43 +825,75 @@ $Region | ForEach-Object -Parallel {
 
 Write-Progress -Activity 'Querying regions' -Completed
 
-# Input validation: any region that returned zero rows is a likely API failure.
-# Note: actual unknown region names are pre-filtered upstream via Get-AzLocation
-# when Az is available, so this primarily catches Retail-API outages or
-# regions with no published VM pricing.
-$regionsWithData = [System.Collections.Generic.HashSet[string]]::new()
-$received        = [System.Collections.Generic.HashSet[string]]::new()
+# ----- Post-run diagnostics: region + VM size coverage ---------------------
+# Index what actually came back so we can explain any gaps precisely.
+$regionsWithData = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$received        = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 foreach ($r in $rows) {
     [void]$regionsWithData.Add($r.Region)
     [void]$received.Add("$($r.Region)|$($r.VmSize)")
 }
 
-$badRegions = @($Region | Where-Object { -not $regionsWithData.Contains($_) })
-if ($badRegions) {
-    Write-Warning "No data returned for region(s): $($badRegions -join ', ')"
+# Region-level "no data" is only actionable when we could NOT pre-validate the
+# region names. When regions were validated against the Azure catalog, an empty
+# region just means none of the requested VM sizes matched there - which the
+# VM-size diagnostics below explain - so we don't blame the (valid) region.
+if ($regionsValidated) {
+    $badRegions = @()
+} else {
+    $badRegions = @($Region | Where-Object { -not $regionsWithData.Contains($_) })
+    if ($badRegions) {
+        Write-Warning "No data returned for region(s): $($badRegions -join ', ') - the name may be invalid or the pricing API returned nothing."
+    }
 }
 
-# Remaining gaps = SKU missing in an otherwise-valid region.
-# Distinguish two cases:
-#   - SKU missing in EVERY valid region  -> likely a typo/unknown SKU name
-#   - SKU missing in SOME valid regions  -> regional availability gap
-$validRegionCount = $Region.Count - $badRegions.Count
-$skuGaps = @{}
-foreach ($r in $Region) {
-    if ($badRegions -contains $r) { continue }
-    foreach ($s in $VmSize) {
-        if (-not $received.Contains("$r|$s")) {
-            if (-not $skuGaps.ContainsKey($s)) { $skuGaps[$s] = [System.Collections.Generic.List[string]]::new() }
-            $skuGaps[$s].Add($r)
+# Regions we actually queried and trust (drop any flagged as bad above).
+$queryRegions = @($Region | Where-Object { $_ -notin $badRegions })
+
+# For each requested VM size, list the queried regions it is MISSING from.
+$skuMissingIn = @{}
+foreach ($s in $VmSize) {
+    $missing = @($queryRegions | Where-Object { -not $received.Contains("$_|$s") })
+    if ($missing.Count -gt 0) { $skuMissingIn[$s] = $missing }
+}
+
+# VM sizes absent from EVERY queried region are ambiguous: a genuine typo, or a
+# real size that simply isn't offered in the chosen regions (e.g. a specialty
+# GPU SKU that only lives in hero regions). Disambiguate with a region-agnostic
+# Retail existence probe so we report the right thing. Only meaningful in
+# pricing mode - an availability-only run already shows 'Unavailable' per region.
+$noDataSkus = @($skuMissingIn.Keys | Where-Object {
+    $queryRegions.Count -gt 0 -and $skuMissingIn[$_].Count -eq $queryRegions.Count })
+$existsGlobally = if ($noDataSkus.Count -gt 0 -and -not $SkipPricing) {
+    Resolve-VmSizeExistence -Sku $noDataSkus -Currency $Currency
+} else {
+    [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+}
+
+$unknownSkus = [System.Collections.Generic.List[string]]::new()
+foreach ($s in $VmSize) {
+    if (-not $skuMissingIn.ContainsKey($s)) { continue }   # present in every queried region
+    $missing = $skuMissingIn[$s]
+    if ($queryRegions.Count -gt 0 -and $missing.Count -eq $queryRegions.Count) {
+        # Missing everywhere we queried.
+        if ($existsGlobally.Contains($s)) {
+            Write-Warning "VM size '$s' is a valid Azure size but is not offered in the selected region(s): $($missing -join ', '). Pick a region where it is available."
+        } elseif (-not $SkipPricing) {
+            Write-Warning "Unknown VM size (not found in the Azure retail catalog): $s - check for typos (names are case-sensitive, e.g. Standard_D2s_v5)."
+            $unknownSkus.Add($s)
+        } else {
+            Write-Warning "VM size '$s' returned no availability data in the selected region(s): $($missing -join ', ')."
         }
+    } else {
+        # Present in some regions, missing in others: a regional availability gap.
+        Write-Warning "VM size '$s' not offered in region(s): $($missing -join ', ')"
     }
 }
-foreach ($s in $skuGaps.Keys) {
-    if ($skuGaps[$s].Count -eq $validRegionCount) {
-        Write-Warning "Unknown SKU (not found in any queried region): $s"
-    } else {
-        Write-Warning "SKU not available in region(s): $s ($($skuGaps[$s] -join ', '))"
-    }
+
+# Mirror the all-regions-invalid behavior: if EVERY requested VM size is an
+# unknown name, stop hard rather than exiting quietly with an empty table.
+if ($queryRegions.Count -gt 0 -and $VmSize.Count -gt 0 -and $unknownSkus.Count -eq $VmSize.Count) {
+    throw "None of the specified VM sizes are valid Azure VM size names: $($unknownSkus -join ', '). Check for typos (names are case-sensitive, e.g. Standard_D2s_v5)."
 }
 
 # Commitment-pricing gaps: for each SKU present in the results, identify which
