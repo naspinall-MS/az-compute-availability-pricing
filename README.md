@@ -24,8 +24,8 @@ one or more subscriptions, regions, and VM sizes.
 > **Note:** Pricing is **Linux compute** by default. SQL / Red Hat / other ISV
 > license premiums are never included. Pass `-IncludeWindows` to add Windows
 > rows (which bundle the Windows Server license premium). Reserved Instances and
-> Savings Plans only discount the **compute** portion — the OS license is always
-> billed at PAYGO rates.
+> Savings Plans only discount the **compute** portion — the OS license is
+> billed at PAYGO rates unless `-ACD` is specified.
 
 ## How the two data sources combine
 
@@ -91,7 +91,7 @@ CSV); all other parameters are optional.
 | `-Region` | `string[]` | One or more ARM region names (e.g. `australiaeast`, `northeurope`, `eastus`). Invalid names are pruned when Az is available. Optional when `-RegionCsv` is supplied. |
 | `-RegionCsv` | `string` | Path to a CSV file of ARM region names. Values may be comma-separated on one line, one per line, or a mix, with or without a header row (a leading `Region`/`Location`/`Name` header is ignored). Merged with any inline `-Region` values. |
 | `-IncludeSpot` | `switch` | Include Spot pricing. Spot is highly variable; the API returns the current published rate at query time. |
-| `-IncludeWindows` | `switch` | Add Windows-licensed rows alongside Linux. Windows rows bundle the Windows Server license premium (not discounted by RI/SP). |
+| `-IncludeWindows` | `switch` | Add Windows-licensed rows alongside Linux. Windows rows bundle the Windows Server license premium — not discounted by RI/SP (it bills at PAYGO), though `-ACD` still applies. |
 | `-HoursPerMonth` | `int` | Hours used to project hourly rates into monthly costs. Default `730` (Azure billing convention: 365.25 × 24 / 12). |
 | `-ACD` | `double` | All-up customer discount percentage (0–100) applied to the PAYGO rate to reflect EA/MCA negotiated pricing. Applies to the entire PAYGO rate, including the Windows license premium. RI/SP compute rates are unchanged, but because the Windows license bills at PAYGO, ACD discounts it there too; Save% is recalculated against the discounted baseline. Default `0`. **Note:** this is a single flat discount applied uniformly — it does not model SKU-level or product-specific negotiated discounts (see [Notes & caveats](#notes--caveats)). |
 | `-InstanceCount` | `int` | Multiply all monthly cost columns by this count to project an N-instance deployment. Save% is unaffected. Default `1`. |
@@ -216,8 +216,9 @@ run-context fields (`Currency`, `SpotIncluded`, `WindowsLicenseIncluded`,
 
 ## Notes & caveats
 
-- Pricing is **list price** unless `-ACD` is supplied. Even then, only PAYGO is
-  discounted — RI/SP are always list.
+- Pricing is **list price** unless `-ACD` is supplied. Even then, only
+  PAYGO-billed amounts are discounted — including the Windows license premium —
+  while RI/SP commitment rates are always list.
 - > **`-ACD` is a single flat discount only.** It applies one uniform percentage
   > to every PAYGO rate in the run. Some customers negotiate **SKU-level or
   > product-specific discounts** (e.g. a deeper discount on a particular VM
