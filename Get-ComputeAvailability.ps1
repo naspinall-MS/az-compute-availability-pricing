@@ -145,7 +145,18 @@
     table) so they can be filtered, sorted, or exported by the caller.
 
 .PARAMETER ThrottleLimit
-    Max parallel region queries. Default 5.
+    Max parallel availability queries (per-region or per-subscription calls).
+    Default 5. Backoff on HTTP 429/503 self-regulates the effective rate, so
+    this can be raised for large multi-subscription runs.
+
+.PARAMETER CollapseRegionThreshold
+    Availability lookups query Microsoft.Compute/skus per (subscription x region)
+    by default, which is fastest for a handful of regions. When the number of
+    requested regions is >= this value, the script instead issues ONE unfiltered
+    call per subscription (all regions) and filters client-side - trading a
+    larger payload for far fewer calls, which avoids ARM read throttling when
+    fanning out across many subscriptions. Default 8. Set very high to always
+    use per-region calls, or to 1 to always collapse.
 
 .EXAMPLE
     .\Get-ComputeAvailability.ps1 -Region australiaeast,eastus -VmSize Standard_D2s_v5,Standard_D4s_v5
@@ -185,7 +196,9 @@ param(
     [string[]]$SubscriptionId  = @(),
     [string]$SubscriptionIdCsv = '',
     [ValidateRange(1, [int]::MaxValue)]
-    [int]$ThrottleLimit      = 5
+    [int]$ThrottleLimit      = 5,
+    [ValidateRange(1, [int]::MaxValue)]
+    [int]$CollapseRegionThreshold = 8
 )
 
 Set-StrictMode -Version 1
@@ -234,6 +247,49 @@ if ($RegionCsv) {
 if ($SubscriptionIdCsv) {
     $csvSubs        = Import-CsvValues -Path $SubscriptionIdCsv -Header @('SubscriptionId','Subscription','Id')
     $SubscriptionId = @($SubscriptionId + $csvSubs | Where-Object { $_ } | Select-Object -Unique)
+}
+
+# Remove duplicate subscription IDs (case-insensitive) up front - Select-Object
+# -Unique is case-SENSITIVE and inline -SubscriptionId values aren't otherwise
+# de-duplicated, so repeated IDs would inflate the run-summary header and spawn
+# duplicate availability work.
+if ($SubscriptionId.Count -gt 1) {
+    $seenSub        = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $beforeSubCount = $SubscriptionId.Count
+    $SubscriptionId = @($SubscriptionId | Where-Object { $_ -and $seenSub.Add($_.Trim()) } | ForEach-Object { $_.Trim() })
+    $removedSubs    = $beforeSubCount - $SubscriptionId.Count
+    if ($removedSubs -gt 0) {
+        # Surface this so a bulk-list caller doesn't mistake collapsed duplicates
+        # for "missing" output rows.
+        Write-Host "Note: removed $removedSubs duplicate subscription ID(s)." -ForegroundColor Yellow
+    }
+}
+
+# Remove duplicate VM sizes (case-insensitive) up front. Regions are already
+# de-duplicated during region validation, but SKUs never were, so repeated
+# -VmSize values would produce duplicate rows. First-seen casing is preserved
+# because the ARM/Retail SKU filters are case-sensitive.
+if ($VmSize.Count -gt 1) {
+    $seenSku      = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $beforeSkuCnt = $VmSize.Count
+    $VmSize       = @($VmSize | Where-Object { $_ -and $seenSku.Add($_.Trim()) } | ForEach-Object { $_.Trim() })
+    $removedSkus  = $beforeSkuCnt - $VmSize.Count
+    if ($removedSkus -gt 0) {
+        Write-Host "Note: removed $removedSkus duplicate VM size(s)." -ForegroundColor Yellow
+    }
+}
+
+# Remove duplicate regions (case-insensitive) up front. Region validation later
+# normalizes survivors to Azure's canonical casing, but doing it here lets us
+# report collapsed duplicates alongside subscriptions and VM sizes.
+if ($Region.Count -gt 1) {
+    $seenRegion  = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $beforeRegCnt = $Region.Count
+    $Region      = @($Region | Where-Object { $_ -and $seenRegion.Add($_.Trim()) } | ForEach-Object { $_.Trim() })
+    $removedRegs = $beforeRegCnt - $Region.Count
+    if ($removedRegs -gt 0) {
+        Write-Host "Note: removed $removedRegs duplicate region(s)." -ForegroundColor Yellow
+    }
 }
 
 if ($VmSize.Count -eq 0) {
@@ -310,6 +366,20 @@ function Test-RetailRegionHasVm {
     } catch {
         Write-Verbose "Region existence probe failed for '$Region': $($_.Exception.Message)"
         return $true
+    }
+}
+
+function Get-ArmAccessToken {
+    # Returns a plain-string ARM bearer token, handling both the SecureString
+    # (Az.Accounts >= 2.20) and legacy plain-string shapes. Interactive user
+    # contexts refresh silently, so calling this again mid-run yields a fresh
+    # token without re-prompting - which lets long, multi-thousand-subscription
+    # runs outlive the ~60-90 min token lifetime.
+    $tr = Get-AzAccessToken -ResourceUrl 'https://management.azure.com/' -ErrorAction Stop
+    if ($tr.Token -is [System.Security.SecureString]) {
+        [System.Net.NetworkCredential]::new('', $tr.Token).Password
+    } else {
+        [string]$tr.Token
     }
 }
 
@@ -446,106 +516,224 @@ if (-not $SkipAvailability) {
         $ctx = Get-AzContext -ErrorAction Stop
         if ($null -eq $ctx -or -not $ctx.Subscription) { throw 'No active Azure context.' }
 
-        # Acquire ARM token once. Newer Az.Accounts (>=2.20) returns SecureString
-        # by default; older versions return plain string. Handle both shapes.
-        $tokenResult = Get-AzAccessToken -ResourceUrl 'https://management.azure.com/' -ErrorAction Stop
-        $armToken    = if ($tokenResult.Token -is [System.Security.SecureString]) {
-            [System.Net.NetworkCredential]::new('', $tokenResult.Token).Password
-        } else { [string]$tokenResult.Token }
+        # Acquire the initial ARM token. On long multi-thousand-subscription
+        # runs the token is refreshed between work chunks (below) so it can't
+        # expire mid-run; interactive user contexts refresh silently.
+        $armToken      = Get-ArmAccessToken
+        $tokenAcquired = [datetime]::UtcNow
 
-        $workItems = @(foreach ($sub in $subs) {
-            if (-not $sub.Id) { continue }   # placeholder sub, skip availability
-            foreach ($r in $Region) {
-                @{ SubId = $sub.Id; SubName = $sub.Name; Region = $r }
-            }
-        })
+        # Decide the query shape (see -CollapseRegionThreshold):
+        #   per-region -> one filtered call per (sub x region); small payloads,
+        #                 fastest for a few regions.
+        #   collapsed  -> one unfiltered call per sub (all regions), filtered
+        #                 client-side; far fewer calls, best when many regions
+        #                 are requested across many subscriptions.
+        $collapseRegions = ($Region.Count -ge $CollapseRegionThreshold)
+        if ($collapseRegions) {
+            $workItems = @(foreach ($sub in $subs) {
+                if (-not $sub.Id) { continue }
+                @{ SubId = $sub.Id; SubName = $sub.Name; Region = $null }
+            })
+        } else {
+            $workItems = @(foreach ($sub in $subs) {
+                if (-not $sub.Id) { continue }   # placeholder sub, skip availability
+                foreach ($r in $Region) {
+                    @{ SubId = $sub.Id; SubName = $sub.Name; Region = $r }
+                }
+            })
+        }
 
         if ($workItems.Count -gt 0) {
-            Write-Progress -Activity 'SKU availability lookup' -Status "$($workItems.Count) subscription/region pair(s)..."
-            $availResults = [System.Collections.Concurrent.ConcurrentBag[hashtable]]::new()
+            $shapeDesc = if ($collapseRegions) {
+                "$($workItems.Count) subscription(s), all regions per call"
+            } else {
+                "$($workItems.Count) subscription/region pair(s)"
+            }
+            Write-Progress -Activity 'SKU availability lookup' -Status "$shapeDesc..."
+            $availResults  = [System.Collections.Concurrent.ConcurrentBag[hashtable]]::new()
             $availFailures = [System.Collections.Concurrent.ConcurrentBag[hashtable]]::new()
-            $vmSizeSet    = [System.Collections.Generic.HashSet[string]]::new(
+            $vmSizeSet     = [System.Collections.Generic.HashSet[string]]::new(
                 [string[]]$VmSize, [System.StringComparer]::OrdinalIgnoreCase)
+            $reqRegions    = [string[]]$Region
 
-            $workItems | ForEach-Object -Parallel {
-                $item     = $_
-                $token    = $using:armToken
-                $skuSet   = $using:vmSizeSet
-                $bag      = $using:availResults
-                $failBag  = $using:availFailures
-
-                $filter = "location eq '$($item.Region)'"
-                $uri    = "https://management.azure.com/subscriptions/$($item.SubId)/providers/Microsoft.Compute/skus?api-version=2021-07-01&`$filter=$([Uri]::EscapeDataString($filter))"
-                $headers = @{ Authorization = "Bearer $token" }
-                $allItems = [System.Collections.Generic.List[object]]::new()
-                try {
-                    do {
-                        $resp = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
-                        if ($resp.value) { $allItems.AddRange([object[]]$resp.value) }
-                        $uri = if ($resp.PSObject.Properties['nextLink'] -and $resp.nextLink) { $resp.nextLink } else { $null }
-                    } while ($uri)
-                } catch {
-                    # Capture the HTTP status (if any) so the main thread can
-                    # apply the reconnect-once rule; parallel runspaces can't
-                    # coordinate a shared 'already warned' flag deterministically.
-                    $status = 0
-                    if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
-                        try { $status = [int]$_.Exception.Response.StatusCode } catch { $status = 0 }
+            # Process work in chunks so the ARM token can be refreshed between
+            # chunks (guards against token expiry on long runs) without having
+            # to share a mutable secret across parallel runspaces.
+            $chunkSize          = [Math]::Max($ThrottleLimit * 20, 250)
+            $refreshIntervalMin = 40
+            $done               = 0
+            for ($i = 0; $i -lt $workItems.Count; $i += $chunkSize) {
+                if (([datetime]::UtcNow - $tokenAcquired).TotalMinutes -ge $refreshIntervalMin) {
+                    try {
+                        $armToken      = Get-ArmAccessToken
+                        $tokenAcquired = [datetime]::UtcNow
+                    } catch {
+                        Write-Warning "ARM token refresh failed; continuing with the existing token: $($_.Exception.Message)"
                     }
-                    $failBag.Add(@{
-                        SubId   = $item.SubId
-                        SubName = $item.SubName
-                        Region  = $item.Region
-                        Status  = $status
-                        Message = $_.Exception.Message
-                    })
-                    return
                 }
+                $end   = [Math]::Min($i + $chunkSize - 1, $workItems.Count - 1)
+                $chunk = @($workItems[$i..$end])
 
-                foreach ($s in $allItems) {
-                    if ($s.resourceType -ne 'virtualMachines') { continue }
-                    if (-not $skuSet.Contains($s.name))        { continue }
+                $chunk | ForEach-Object -Parallel {
+                    $item     = $_
+                    $token    = $using:armToken
+                    $skuSet   = $using:vmSizeSet
+                    $bag      = $using:availResults
+                    $failBag  = $using:availFailures
+                    $reqRegs  = $using:reqRegions
 
-                    # Physical zones the SKU is offered in for this region
-                    # (raw locationInfo, NOT reduced by restrictions).
-                    $physicalZones = @()
-                    if ($s.locationInfo -and $s.locationInfo[0].zones) {
-                        $physicalZones = @($s.locationInfo[0].zones | Sort-Object)
+                    if ($item.Region) {
+                        $filter = "location eq '$($item.Region)'"
+                        $uri    = "https://management.azure.com/subscriptions/$($item.SubId)/providers/Microsoft.Compute/skus?api-version=2021-07-01&`$filter=$([Uri]::EscapeDataString($filter))"
+                    } else {
+                        # Collapsed mode: all regions in one call, filter client-side.
+                        $uri    = "https://management.azure.com/subscriptions/$($item.SubId)/providers/Microsoft.Compute/skus?api-version=2021-07-01"
                     }
-                    # Restrictions are kept separate from physical availability:
-                    #   Location -> whole SKU unavailable to the sub in the region
-                    #   Zone     -> specific zones unavailable to the sub
-                    $regionBlocked   = $false
-                    $regionReason    = ''
-                    $restrictedZones = @()
-                    $zoneReason      = ''
-                    if ($s.restrictions) {
-                        foreach ($rest in $s.restrictions) {
-                            switch ($rest.type) {
-                                'Location' {
-                                    $regionBlocked = $true
-                                    if ($rest.reasonCode) { $regionReason = $rest.reasonCode }
-                                }
-                                'Zone'     {
-                                    if ($rest.restrictionInfo -and $rest.restrictionInfo.zones) {
-                                        $restrictedZones += @($rest.restrictionInfo.zones)
+                    $headers    = @{ Authorization = "Bearer $token" }
+                    $allItems   = [System.Collections.Generic.List[object]]::new()
+                    $maxRetries = 6
+                    try {
+                        do {
+                            $attempt = 0
+                            $resp    = $null
+                            while ($true) {
+                                try {
+                                    $resp = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
+                                    break
+                                } catch {
+                                    # Retry ARM throttling (429) and transient 503s
+                                    # with exponential backoff + jitter, honoring a
+                                    # Retry-After header when the service supplies one.
+                                    $st = 0; $retryAfter = 0
+                                    if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
+                                        $r = $_.Exception.Response
+                                        try { $st = [int]$r.StatusCode } catch { $st = 0 }
+                                        try {
+                                            if ($r.Headers -and $r.Headers.RetryAfter) {
+                                                $rc = $r.Headers.RetryAfter
+                                                if ($rc.Delta -and $rc.Delta.HasValue) {
+                                                    $retryAfter = [int]$rc.Delta.Value.TotalSeconds
+                                                } elseif ($rc.Date -and $rc.Date.HasValue) {
+                                                    $retryAfter = [int]($rc.Date.Value.UtcDateTime - [datetime]::UtcNow).TotalSeconds
+                                                }
+                                            }
+                                        } catch { $retryAfter = 0 }
                                     }
-                                    if ($rest.reasonCode) { $zoneReason = $rest.reasonCode }
+                                    if (($st -eq 429 -or $st -eq 503) -and $attempt -lt $maxRetries) {
+                                        $attempt++
+                                        $delay = if ($retryAfter -gt 0) { [double]$retryAfter } else { [Math]::Min([Math]::Pow(2, $attempt), 30) }
+                                        $delay += (Get-Random -Minimum 0 -Maximum 1000) / 1000.0
+                                        Start-Sleep -Seconds $delay
+                                        continue
+                                    }
+                                    throw
                                 }
                             }
+                            if ($resp.value) { $allItems.AddRange([object[]]$resp.value) }
+                            $uri = if ($resp.PSObject.Properties['nextLink'] -and $resp.nextLink) { $resp.nextLink } else { $null }
+                        } while ($uri)
+                    } catch {
+                        # Capture the HTTP status (if any) so the main thread can
+                        # apply the reconnect-once rule; parallel runspaces can't
+                        # coordinate a shared 'already warned' flag deterministically.
+                        $status = 0
+                        if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
+                            try { $status = [int]$_.Exception.Response.StatusCode } catch { $status = 0 }
+                        }
+                        $failBag.Add(@{
+                            SubId   = $item.SubId
+                            SubName = $item.SubName
+                            Region  = if ($item.Region) { $item.Region } else { '(all)' }
+                            Status  = $status
+                            Message = $_.Exception.Message
+                        })
+                        return
+                    }
+
+                    # Target regions for this response: the single filtered region,
+                    # or the requested set (collapsed mode).
+                    $targets = if ($item.Region) { @($item.Region) } else { $reqRegs }
+
+                    foreach ($s in $allItems) {
+                        if ($s.resourceType -ne 'virtualMachines') { continue }
+                        if (-not $skuSet.Contains($s.name))        { continue }
+
+                        foreach ($tRegion in $targets) {
+                            # locationInfo entry for this region (a single SKU item
+                            # can carry many regions in collapsed responses).
+                            $li = $null
+                            if ($s.locationInfo) {
+                                foreach ($x in $s.locationInfo) {
+                                    if ($x.location -and ($x.location -ieq $tRegion)) { $li = $x; break }
+                                }
+                            }
+                            if (-not $li -and $item.Region -and $s.locationInfo) { $li = $s.locationInfo[0] }
+                            # Not offered in this region -> nothing to record.
+                            if (-not $li) { continue }
+
+                            # Physical zones the SKU is offered in for this region
+                            # (raw locationInfo, NOT reduced by restrictions).
+                            $physicalZones = @()
+                            if ($li.zones) { $physicalZones = @($li.zones | Sort-Object) }
+
+                            # Restrictions are kept separate from physical
+                            # availability and matched to THIS region (collapsed
+                            # responses carry restrictions for many regions):
+                            #   Location -> whole SKU unavailable to the sub here
+                            #   Zone     -> specific zones unavailable to the sub
+                            $regionBlocked   = $false
+                            $regionReason    = ''
+                            $restrictedZones = @()
+                            $zoneReason      = ''
+                            if ($s.restrictions) {
+                                foreach ($rest in $s.restrictions) {
+                                    $applies = $false
+                                    if ($rest.restrictionInfo -and $rest.restrictionInfo.locations) {
+                                        foreach ($rl in $rest.restrictionInfo.locations) {
+                                            if ($rl -ieq $tRegion) { $applies = $true; break }
+                                        }
+                                    } elseif ($rest.PSObject.Properties['values'] -and $rest.values) {
+                                        foreach ($rv in $rest.values) {
+                                            if ($rv -ieq $tRegion) { $applies = $true; break }
+                                        }
+                                    } elseif ($item.Region) {
+                                        # Region-filtered response: the restriction
+                                        # is already scoped to the queried region.
+                                        $applies = $true
+                                    }
+                                    if (-not $applies) { continue }
+                                    switch ($rest.type) {
+                                        'Location' {
+                                            $regionBlocked = $true
+                                            if ($rest.reasonCode) { $regionReason = $rest.reasonCode }
+                                        }
+                                        'Zone'     {
+                                            if ($rest.restrictionInfo -and $rest.restrictionInfo.zones) {
+                                                $restrictedZones += @($rest.restrictionInfo.zones)
+                                            }
+                                            if ($rest.reasonCode) { $zoneReason = $rest.reasonCode }
+                                        }
+                                    }
+                                }
+                            }
+                            $restrictedZones = @($restrictedZones | Sort-Object -Unique)
+                            $bag.Add(@{
+                                Key             = "$($item.SubId)|$tRegion|$($s.name)"
+                                PhysicalZones   = $physicalZones
+                                RegionBlocked   = $regionBlocked
+                                RegionReason    = $regionReason
+                                RestrictedZones = $restrictedZones
+                                ZoneReason      = $zoneReason
+                            })
                         }
                     }
-                    $restrictedZones = @($restrictedZones | Sort-Object -Unique)
-                    $bag.Add(@{
-                        Key             = "$($item.SubId)|$($item.Region)|$($s.name)"
-                        PhysicalZones   = $physicalZones
-                        RegionBlocked   = $regionBlocked
-                        RegionReason    = $regionReason
-                        RestrictedZones = $restrictedZones
-                        ZoneReason      = $zoneReason
-                    })
-                }
-            } -ThrottleLimit $ThrottleLimit
+                } -ThrottleLimit $ThrottleLimit
+
+                $done += $chunk.Count
+                Write-Progress -Activity 'SKU availability lookup' `
+                    -Status "$done / $($workItems.Count) processed" `
+                    -PercentComplete ([Math]::Min(100, [int](100 * $done / $workItems.Count)))
+            }
 
             foreach ($entry in $availResults) {
                 $availMap[$entry.Key] = @{
@@ -689,7 +877,18 @@ Write-Host '================================================================' -F
 Write-Host '  Azure Virtual Machine Availability + Price Comparison' -ForegroundColor Cyan
 Write-Host "  Regions        : $($Region -join ', ')" -ForegroundColor Cyan
 Write-Host "  VM Sizes       : $($VmSize -join ', ')" -ForegroundColor Cyan
-if ($SubscriptionId -and -not $SkipAvailability) { Write-Host "  Subscriptions  : $($SubscriptionId -join ', ')" -ForegroundColor Cyan }
+if ($SubscriptionId -and -not $SkipAvailability) {
+    # Long subscription lists (dozens+) would swamp the header, so show only the
+    # first few and summarize the remainder with a count.
+    $subPreviewMax = 5
+    if ($SubscriptionId.Count -le $subPreviewMax) {
+        Write-Host "  Subscriptions  : $($SubscriptionId -join ', ')" -ForegroundColor Cyan
+    } else {
+        $shown  = ($SubscriptionId | Select-Object -First $subPreviewMax) -join ', '
+        $more   = $SubscriptionId.Count - $subPreviewMax
+        Write-Host "  Subscriptions  : $shown, ... (+$more more; $($SubscriptionId.Count) total)" -ForegroundColor Cyan
+    }
+}
 # Spot / license / hours / discount / instance options only affect pricing
 # output; hide the whole group when pricing is skipped.
 if (-not $SkipPricing) {
