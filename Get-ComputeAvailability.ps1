@@ -13,7 +13,7 @@
                       the script still returns pricing data and the availability
                       columns show '?'.
 
-    Availability info surfaces as three separate columns:
+    Availability info surfaces as these columns (ZoneMapping is opt-in):
       - RegionAvailability: 'Available' (the SKU is listed/offered in the
         region) or 'Unavailable' (not listed); '?' when the lookup was skipped.
       - ZoneAvailability: the zones the SKU is offered in (e.g. "1,2,3"),
@@ -26,6 +26,11 @@
         currently blocked for the subscription regionally and/or zonally; these
         are allowlist gates that require a support case to unblock - unlike
         'Unavailable', where the SKU simply isn't offered.
+      - ZoneMapping (opt-in via -IncludeZoneMapping): each logical zone and
+        the physical zone it maps to, shown as logical=physical
+        (e.g. "1=az2; 2=az1; 3=az3"), since logical zone numbers are randomized
+        per subscription. A note above the table explains the format. 'N/A' for
+        non-zonal regions, '?' when the mapping lookup was skipped or failed.
 
     Compute has BOTH commitment-discount mechanisms (unlike storage):
       - Reserved Instances (RI):  SKU-locked, 1-year or 3-year terms.
@@ -83,6 +88,16 @@
     by Reserved Instances or Savings Plans (those only discount compute).
     Customers with Azure Hybrid Benefit (AHB) should ignore Windows rows and
     use the Linux rows + their own AHB-licensed pricing.
+
+.PARAMETER IncludeZoneMapping
+    Add a ZoneMapping column showing which physical availability zone (e.g.
+    az1) each logical zone maps to. Logical zone numbers ('1','2','3')
+    are randomized per subscription, so the physical zone is what makes zone
+    availability comparable across subscriptions. Sourced from the
+    Microsoft.Resources locations API (availabilityZoneMappings) - one GET per
+    subscription (all regions). Requires availability to be enabled; ignored
+    with -SkipAvailability. The physical zone shows as the short id (az1) since
+    the region is already its own column.
 
 .PARAMETER HoursPerMonth
     Hours used to project hourly rates into monthly costs. Default 730
@@ -180,6 +195,7 @@ param(
     [string]$RegionCsv       = '',
     [switch]$IncludeSpot,
     [switch]$IncludeWindows,
+    [switch]$IncludeZoneMapping,
     [ValidateRange(1, [int]::MaxValue)]
     [int]$HoursPerMonth      = 730,
     [ValidateRange(0, 100)]
@@ -406,6 +422,9 @@ try {
 
 if ($SkipAvailability -and $SubscriptionId.Count -gt 0) {
     Write-Warning "-SubscriptionId is ignored with -SkipAvailability (subscription scope only affects availability); pricing is identical across subscriptions, so a single row set is produced."
+}
+if ($SkipAvailability -and $IncludeZoneMapping) {
+    Write-Warning "-IncludeZoneMapping is ignored with -SkipAvailability (zone mapping is part of the availability lookup)."
 }
 
 if ($SubscriptionId.Count -gt 0 -and -not $SkipAvailability) {
@@ -774,6 +793,122 @@ if (-not $SkipAvailability) {
     }
 }
 
+# ----- Logical -> physical availability zone mapping (opt-in) --------------
+# -IncludeZoneMapping augments the output with the physical zone (e.g.
+# eastus-az1) each logical zone maps to. Logical zone numbers are randomized per
+# subscription, so the physical name is what makes zone availability comparable
+# across subscriptions. Source: the Microsoft.Resources locations API
+# (availabilityZoneMappings) - ONE GET per subscription returns the mapping for
+# every region, so cost is 1 call per sub regardless of region count. Runs only
+# when availability is enabled (needs an Azure context/token).
+$zoneMap    = @{}   # "subId|region" -> @{ '1'='eastus-az1'; ... }
+$zoneSubsOk = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+if ($IncludeZoneMapping -and -not $SkipAvailability -and $availAvailable) {
+    try {
+        $zmToken         = Get-ArmAccessToken
+        $zmTokenAcquired = [datetime]::UtcNow
+        $zmSubs          = @(foreach ($sub in $subs) { if ($sub.Id) { $sub.Id } })
+        if ($zmSubs.Count -gt 0) {
+            Write-Progress -Activity 'Zone mapping lookup' -Status "$($zmSubs.Count) subscription(s)..."
+            $zmResults  = [System.Collections.Concurrent.ConcurrentBag[hashtable]]::new()
+            $zmOk       = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
+            $zmFailures = [System.Collections.Concurrent.ConcurrentBag[hashtable]]::new()
+            $zmRegions  = [System.Collections.Generic.HashSet[string]]::new(
+                [string[]]$Region, [System.StringComparer]::OrdinalIgnoreCase)
+
+            # Chunk so the ARM token can be refreshed between waves on long runs.
+            $chunkSize = [Math]::Max($ThrottleLimit * 20, 250)
+            $done      = 0
+            for ($i = 0; $i -lt $zmSubs.Count; $i += $chunkSize) {
+                if (([datetime]::UtcNow - $zmTokenAcquired).TotalMinutes -ge 40) {
+                    try { $zmToken = Get-ArmAccessToken; $zmTokenAcquired = [datetime]::UtcNow }
+                    catch { Write-Warning "ARM token refresh failed; continuing with the existing token: $($_.Exception.Message)" }
+                }
+                $end   = [Math]::Min($i + $chunkSize - 1, $zmSubs.Count - 1)
+                $chunk = @($zmSubs[$i..$end])
+
+                $chunk | ForEach-Object -Parallel {
+                    $subId   = $_
+                    $token   = $using:zmToken
+                    $bag     = $using:zmResults
+                    $okBag   = $using:zmOk
+                    $failBag = $using:zmFailures
+                    $regSet  = $using:zmRegions
+                    $uri     = "https://management.azure.com/subscriptions/$subId/locations?api-version=2022-12-01"
+                    $headers = @{ Authorization = "Bearer $token" }
+                    $maxRetries = 6
+                    try {
+                        $resp    = $null
+                        $attempt = 0
+                        while ($true) {
+                            try {
+                                $resp = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
+                                break
+                            } catch {
+                                # Retry ARM throttling (429) and transient 503s with
+                                # exponential backoff + jitter, honoring Retry-After.
+                                $st = 0; $retryAfter = 0
+                                if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
+                                    $r = $_.Exception.Response
+                                    try { $st = [int]$r.StatusCode } catch { $st = 0 }
+                                    try {
+                                        if ($r.Headers -and $r.Headers.RetryAfter -and $r.Headers.RetryAfter.Delta -and $r.Headers.RetryAfter.Delta.HasValue) {
+                                            $retryAfter = [int]$r.Headers.RetryAfter.Delta.Value.TotalSeconds
+                                        }
+                                    } catch { $retryAfter = 0 }
+                                }
+                                if (($st -eq 429 -or $st -eq 503) -and $attempt -lt $maxRetries) {
+                                    $attempt++
+                                    $delay = if ($retryAfter -gt 0) { [double]$retryAfter } else { [Math]::Min([Math]::Pow(2, $attempt), 30) }
+                                    $delay += (Get-Random -Minimum 0 -Maximum 1000) / 1000.0
+                                    Start-Sleep -Seconds $delay
+                                    continue
+                                }
+                                throw
+                            }
+                        }
+                        if ($resp.value) {
+                            foreach ($loc in $resp.value) {
+                                if (-not $loc.name -or -not $regSet.Contains($loc.name)) { continue }
+                                if (-not $loc.PSObject.Properties['availabilityZoneMappings'] -or -not $loc.availabilityZoneMappings) { continue }
+                                $m = @{}
+                                foreach ($azm in $loc.availabilityZoneMappings) {
+                                    if ($azm.logicalZone -and $azm.physicalZone) { $m[[string]$azm.logicalZone] = [string]$azm.physicalZone }
+                                }
+                                if ($m.Count -gt 0) { $bag.Add(@{ SubId = $subId; Region = $loc.name; Zones = $m }) }
+                            }
+                        }
+                        # Success (even with no zonal regions) -> record so non-zonal
+                        # regions render 'N/A' rather than '?'.
+                        $okBag.Add($subId)
+                    } catch {
+                        $status = 0
+                        if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
+                            try { $status = [int]$_.Exception.Response.StatusCode } catch { $status = 0 }
+                        }
+                        $failBag.Add(@{ SubId = $subId; Status = $status; Message = $_.Exception.Message })
+                    }
+                } -ThrottleLimit $ThrottleLimit
+
+                $done += $chunk.Count
+                Write-Progress -Activity 'Zone mapping lookup' `
+                    -Status "$done / $($zmSubs.Count) processed" `
+                    -PercentComplete ([Math]::Min(100, [int](100 * $done / $zmSubs.Count)))
+            }
+
+            foreach ($z in $zmResults) { $zoneMap["$($z.SubId)|$($z.Region)"] = $z.Zones }
+            foreach ($s in $zmOk)      { [void]$zoneSubsOk.Add($s) }
+            if ($zmFailures.Count -gt 0) {
+                $n = @($zmFailures).Count
+                Write-Warning "Zone mapping lookup failed for $n subscription(s); their rows show '?' for ZoneMapping."
+            }
+            Write-Progress -Activity 'Zone mapping lookup' -Completed
+        }
+    } catch {
+        Write-Warning "Zone mapping unavailable - $($_.Exception.Message)"
+    }
+}
+
 # ----- Canonicalize VM SKU names ------------------------------------------
 # The Retail API's armSkuName filter is case-sensitive server-side
 # (armSkuName eq 'standard_d2s_v5' returns zero rows), so a valid size typed in
@@ -934,6 +1069,9 @@ $Region | ForEach-Object -Parallel {
     $availMap     = $using:availMap
     $availOn      = $using:availAvailable
     $availFailedSet = $using:availFailed
+    $zoneMap      = $using:zoneMap
+    $zoneSubsOk   = $using:zoneSubsOk
+    $includeZoneMap = $using:IncludeZoneMapping
     $subs         = $using:subs
     $rowsBag      = $using:rows
     $currency     = $using:Currency
@@ -1116,6 +1254,22 @@ $Region | ForEach-Object -Parallel {
           }
         }
 
+        # Logical -> physical zone mapping for this (sub, region), independent of
+        # the SKU. '?' when the lookup wasn't run/failed for the sub; 'N/A' for a
+        # non-zonal region. The region is already its own column, so the physical
+        # zone is stored as the short id (az1), dropping the redundant region prefix.
+        $zoneMapping = '?'
+        if ($includeZoneMap -and $sub.Id) {
+            if ($zoneSubsOk.Contains($sub.Id)) {
+                $zm = $zoneMap["$($sub.Id)|$region"]
+                if ($zm -and $zm.Count -gt 0) {
+                    $zoneMapping = (($zm.Keys | Sort-Object) | ForEach-Object { "$_=$($zm[$_] -replace ([regex]::Escape("$region-")), '')" }) -join '; '
+                } else {
+                    $zoneMapping = 'N/A'
+                }
+            }
+        }
+
         $rowsBag.Add([pscustomobject]@{
             SubscriptionName = $sub.Name
             SubscriptionId   = $sub.Id
@@ -1124,6 +1278,7 @@ $Region | ForEach-Object -Parallel {
             RegionAvailability = $regionAvail
             ZoneAvailability   = $zoneAvail
             Restrictions       = $restriction
+            ZoneMapping        = $zoneMapping
             RegionBlocked      = $regionBlocked
             OS              = $os
             PAYGO_PerMonth  = if ($null -ne $payMo)  { [Math]::Round($payMo, 2) }  else { $null }
@@ -1294,6 +1449,7 @@ if ($showSubCols) { $csvProps += 'SubscriptionName', 'SubscriptionId' }
 $csvProps += 'Region', 'VmSize'
 if (-not $SkipAvailability) {
     $csvProps += 'RegionAvailability', 'ZoneAvailability', 'Restrictions'
+    if ($IncludeZoneMapping) { $csvProps += 'ZoneMapping' }
 }
 if (-not $SkipPricing) {
     if ($IncludeWindows) { $csvProps += 'OS' }
@@ -1329,6 +1485,10 @@ if ($sorted.Count -eq 0) {
         $cols += @{n='RegionAvailability'; e={ $_.RegionAvailability }}
         $cols += @{n='ZoneAvailability';   e={ $_.ZoneAvailability }}
         $cols += @{n='Restrictions';       e={ $_.Restrictions }}
+        # Region is already its own column, so the physical zone is the short id (az1).
+        if ($IncludeZoneMapping) {
+            $cols += @{n='ZoneMapping'; e={ $_.ZoneMapping }}
+        }
     }
     if (-not $SkipPricing) {
         if ($IncludeWindows) { $cols += @{n='OS'; e={ $_.OS }} }
@@ -1385,6 +1545,11 @@ if ($sorted.Count -eq 0) {
         $dash = '-' * $_.Length
         if (& $isNumeric $_) { $dash.PadLeft($widths[$_]) } else { $dash.PadRight($widths[$_]) }
     }) -join $sep
+    if ($IncludeZoneMapping -and -not $SkipAvailability) {
+        Write-Host '  NOTE: ZoneMapping is logical=physical zone (e.g. 1=az2). Logical zone numbers are' -ForegroundColor Yellow
+        Write-Host '        randomized per subscription, so compare across subscriptions by physical zone (az).' -ForegroundColor Yellow
+        Write-Host ''
+    }
     Write-Host $headerLine
     Write-Host $underline
     foreach ($row in $sorted) {

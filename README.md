@@ -16,6 +16,7 @@ one or more subscriptions, regions, and VM sizes.
 | Region availability | `Available` (SKU listed/offered in the region) or `Unavailable` (not listed) | `Microsoft.Compute/skus` (ARM) |
 | Zone availability | Zones the SKU is offered in (e.g. `1,2,3`), `N/A` (non-zonal), or `Unavailable` (not listed) | `Microsoft.Compute/skus` (ARM) |
 | Restrictions | Region/zone restriction detail (`Region` and/or `Zone 1,2,3`) — the size is offered but blocked for your subscription; needs a support case | `Microsoft.Compute/skus` (ARM) |
+| Logical→physical zone mapping | Which physical zone (e.g. `az1`) each logical zone maps to — opt-in via `-IncludeZoneMapping` | `Microsoft.Resources` locations API |
 | PAYGO | Pay-as-you-go monthly compute cost | Azure Retail Prices API |
 | Spot | Current published Spot monthly rate + saving vs PAYGO | Azure Retail Prices API |
 | Reserved Instance | 1-year and 3-year monthly cost + saving vs PAYGO | Azure Retail Prices API |
@@ -77,7 +78,7 @@ CSV); all other parameters are optional.
 ```powershell
 .\Get-ComputeAvailability.ps1 -VmSize <string[]> -Region <string[]> `
     [-VmSizeCsv <string>] [-RegionCsv <string>] [-SubscriptionIdCsv <string>] `
-    [-IncludeSpot] [-IncludeWindows] [-HoursPerMonth <int>] [-ACD <double>] `
+    [-IncludeSpot] [-IncludeWindows] [-IncludeZoneMapping] [-HoursPerMonth <int>] [-ACD <double>] `
     [-InstanceCount <int>] [-Currency <string>] [-OutputCsv <string>] [-PassThru] `
     [-SkipAvailability] [-SkipPricing] [-SubscriptionId <string[]>] [-ThrottleLimit <int>]
 ```
@@ -92,6 +93,7 @@ CSV); all other parameters are optional.
 | `-RegionCsv` | `string` | Path to a CSV file of ARM region names. Values may be comma-separated on one line, one per line, or a mix, with or without a header row (a leading `Region`/`Location`/`Name` header is ignored). Merged with any inline `-Region` values. |
 | `-IncludeSpot` | `switch` | Include Spot pricing. Spot is highly variable; the API returns the current published rate at query time. |
 | `-IncludeWindows` | `switch` | Add Windows-licensed rows alongside Linux. Windows rows bundle the Windows Server license premium — not discounted by RI/SP (it bills at PAYGO), though `-ACD` still applies. |
+| `-IncludeZoneMapping` | `switch` | Add a `ZoneMapping` column showing which physical zone (e.g. `az1`) each logical zone maps to. Logical zone numbers are randomized per subscription, so the physical zone makes zone availability comparable across subscriptions. One `GET` per subscription (all regions) via the `Microsoft.Resources` locations API. Requires availability; ignored with `-SkipAvailability`. |
 | `-HoursPerMonth` | `int` | Hours used to project hourly rates into monthly costs. Default `730` (Azure billing convention: 365.25 × 24 / 12). |
 | `-ACD` | `double` | All-up customer discount percentage (0–100) applied to the PAYGO rate to reflect EA/MCA negotiated pricing. Applies to the entire PAYGO rate, including the Windows license premium. RI/SP compute rates are unchanged, but because the Windows license bills at PAYGO, ACD discounts it there too; Save% is recalculated against the discounted baseline. Default `0`. **Note:** this is a single flat discount applied uniformly — it does not model SKU-level or product-specific negotiated discounts (see [Notes & caveats](#notes--caveats)). |
 | `-InstanceCount` | `int` | Multiply all monthly cost columns by this count to project an N-instance deployment. Save% is unaffected. Default `1`. |
@@ -115,6 +117,9 @@ CSV); all other parameters are optional.
 
 # Add Windows-licensed rows alongside Linux
 .\Get-ComputeAvailability.ps1 -Region westeurope -VmSize Standard_D4s_v5 -IncludeWindows
+
+# Show which physical zone each logical zone maps to (comparable across subscriptions)
+.\Get-ComputeAvailability.ps1 -Region eastus,westus2 -VmSize Standard_D2s_v5 -SkipPricing -IncludeZoneMapping
 
 # Apply a negotiated 15% discount and project a 10-instance deployment
 .\Get-ComputeAvailability.ps1 -Region eastus -VmSize Standard_D8s_v5 -ACD 15 -InstanceCount 10
@@ -168,6 +173,7 @@ One row per subscription × region × VM size (× OS when `-IncludeWindows` is s
 | `RegionAvailability` | `Available` (SKU listed/offered in the region) or `Unavailable` (not listed); `?` when the lookup is skipped, unavailable, or failed for that subscription/region (e.g. a 401). |
 | `ZoneAvailability` | Zones the SKU is offered in for the region (e.g. `1,2,3`). `N/A` for a non-zonal region, `Unavailable` when the SKU is not listed, or `?`. |
 | `Restrictions` | `None`, the restriction detail (`Region` for a subscription-level block and/or `Zone 1,2,3` for blocked zones), `VM size not available in region.` when the SKU is not listed, or `Availability lookup failed.` when the per-subscription/region lookup errored (shown as `?` rather than a false negative). A restriction means the size is offered but blocked for your subscription; unblock via a support case. `?` when the lookup is unavailable. |
+| `ZoneMapping` | Logical → physical zone map for the region, shown as `logical=physical` (e.g. `1=az2; 2=az1; 3=az3`), only with `-IncludeZoneMapping`. A note printed above the table explains the format. Since logical zone numbers are randomized per subscription, the physical zone (`az1`) is what makes zones comparable across subscriptions. The zone id is short (`az1`) because the region is already its own column. `N/A` for a non-zonal region, `?` when the mapping lookup was skipped or failed. |
 | `PAYGO/Mo` | Pay-as-you-go monthly cost. Header shows `(-N%)` when `-ACD` is applied. |
 | `Spot/Mo` / `Spot%` | Spot monthly cost and saving vs PAYGO (with `-IncludeSpot`). |
 | `RI1Yr/Mo` / `RI1Yr%` | Reserved Instance 1-year monthly cost and saving. |
@@ -206,6 +212,9 @@ run-context fields (`Currency`, `SpotIncluded`, `WindowsLicenseIncluded`,
   `-ThrottleLimit`) for both availability and pricing.
 - **A single ARM bearer token** is acquired up front and reused across every
   parallel runspace, avoiding per-subscription context serialization.
+- **Logical→physical zone mapping** (with `-IncludeZoneMapping`) is fetched once
+  per subscription from the `Microsoft.Resources` locations API, reusing the same
+  bearer token, chunked token refresh, and 429/503 backoff as the availability pass.
 - **One combined Retail API request per region** fetches both Consumption
   (PAYGO/Spot/Savings Plan) and Reservation records, halving API calls.
 - **Region names are validated** against `Get-AzLocation` before querying, and
