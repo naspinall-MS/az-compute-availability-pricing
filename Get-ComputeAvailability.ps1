@@ -13,7 +13,8 @@
                       the script still returns pricing data and the availability
                       columns show '?'.
 
-    Availability info surfaces as these columns (ZoneMapping is opt-in):
+    Availability info surfaces as these columns (ZoneMapping and the quota
+    columns are opt-in):
       - RegionAvailability: 'Available' (the SKU is listed/offered in the
         region) or 'Unavailable' (not listed); '?' when the lookup was skipped.
       - ZoneAvailability: the zones the SKU is offered in (e.g. "1,2,3"),
@@ -31,6 +32,20 @@
         (e.g. "1=az2; 2=az1; 3=az3"), since logical zone numbers are randomized
         per subscription. A note above the table explains the format. 'N/A' for
         non-zonal regions, '?' when the mapping lookup was skipped or failed.
+      - QuotaUsed / QuotaAvailable (opt-in via -IncludeQuota): vCPUs used and
+        still available (limit - used) in the VM size's family quota for that
+        region and subscription. A note above the table explains the format.
+        'N/A' when the size isn't offered in the region or the region isn't
+        enabled for the subscription, '?' when the quota lookup was skipped
+        or failed.
+
+    Restricted-access regions (e.g. disaster-recovery regions such as
+    switzerlandwest) must be requested per subscription. When every VM size in
+    a region is blocked, the script checks the subscription's Microsoft.Compute
+    provider locations; if the region isn't among them it warns once per region
+    (naming the paired region) and points to the region access request process,
+    rather than leaving only a per-size 'Region' restriction. This costs extra
+    calls only for suspect subscriptions, so a normal run makes none.
 
     Compute has BOTH commitment-discount mechanisms (unlike storage):
       - Reserved Instances (RI):  SKU-locked, 1-year or 3-year terms.
@@ -98,6 +113,16 @@
     subscription (all regions). Requires availability to be enabled; ignored
     with -SkipAvailability. The physical zone shows as the short id (az1) since
     the region is already its own column.
+
+.PARAMETER IncludeQuota
+    Add QuotaUsed and QuotaAvailable columns showing the vCPU quota used and
+    still available (limit - used) for each VM size's family in that region and
+    subscription. Quota is subscription- and region-scoped, sourced from the
+    Microsoft.Compute usages API - one GET per subscription x region where a
+    requested size is offered. Covers the on-demand family vCPU quota only; the
+    regional total vCPU quota (and Spot quota) is separate and also applies.
+    Requires availability to be enabled (the family comes from the SKU lookup);
+    ignored with -SkipAvailability.
 
 .PARAMETER HoursPerMonth
     Hours used to project hourly rates into monthly costs. Default 730
@@ -196,6 +221,7 @@ param(
     [switch]$IncludeSpot,
     [switch]$IncludeWindows,
     [switch]$IncludeZoneMapping,
+    [switch]$IncludeQuota,
     [ValidateRange(1, [int]::MaxValue)]
     [int]$HoursPerMonth      = 730,
     [ValidateRange(0, 100)]
@@ -426,6 +452,9 @@ if ($SkipAvailability -and $SubscriptionId.Count -gt 0) {
 if ($SkipAvailability -and $IncludeZoneMapping) {
     Write-Warning "-IncludeZoneMapping is ignored with -SkipAvailability (zone mapping is part of the availability lookup)."
 }
+if ($SkipAvailability -and $IncludeQuota) {
+    Write-Warning "-IncludeQuota is ignored with -SkipAvailability (quota is keyed by the SKU family from the availability lookup)."
+}
 
 if ($SubscriptionId.Count -gt 0 -and -not $SkipAvailability) {
     if (-not $azAvailable) {
@@ -514,13 +543,16 @@ if ($azAvailable -and ($subs[0].Id -ne '')) {
 }
 
 # Availability map keyed "subId|region|sku" ->
-#   @{ PhysicalZones; RegionBlocked; RegionReason; RestrictedZones; ZoneReason }
+#   @{ Family; PhysicalZones; RegionBlocked; RegionReason; RestrictedZones; ZoneReason }
 # Parallelized across (sub x region) work items via ARM REST. We acquire a
 # single Bearer token up front and reuse it in every parallel runspace, which
 # avoids per-sub Set-AzContext serialization and gives the same ThrottleLimit
 # concurrency the pricing block enjoys.
 $availMap        = @{}
 $availAvailable  = $false
+# "subId|region" -> @{ Total; Blocked }: all VM sizes in the region vs. how many are
+# Location-restricted for the subscription (see the restricted-region check below).
+$regionTotals    = @{}
 # Sub/region pairs whose availability lookup failed (e.g. 401). Rows for these
 # render '?' (unknown) instead of a misleading 'Unavailable'. Defined at main
 # scope so the pricing loop can consume it even when availability is skipped.
@@ -571,6 +603,7 @@ if (-not $SkipAvailability) {
             Write-Progress -Activity 'SKU availability lookup' -Status "$shapeDesc..."
             $availResults  = [System.Collections.Concurrent.ConcurrentBag[hashtable]]::new()
             $availFailures = [System.Collections.Concurrent.ConcurrentBag[hashtable]]::new()
+            $regionTally   = [System.Collections.Concurrent.ConcurrentBag[hashtable]]::new()
             $vmSizeSet     = [System.Collections.Generic.HashSet[string]]::new(
                 [string[]]$VmSize, [System.StringComparer]::OrdinalIgnoreCase)
             $reqRegions    = [string[]]$Region
@@ -599,7 +632,22 @@ if (-not $SkipAvailability) {
                     $skuSet   = $using:vmSizeSet
                     $bag      = $using:availResults
                     $failBag  = $using:availFailures
+                    $tallyBag = $using:regionTally
                     $reqRegs  = $using:reqRegions
+
+                    function Test-RegionBlocked {
+                        param($Sku, [string]$Loc, [bool]$Filtered)
+                        if (-not $Sku.restrictions) { return $false }
+                        foreach ($rest in $Sku.restrictions) {
+                            if ($rest.type -ne 'Location') { continue }
+                            if ($rest.restrictionInfo -and $rest.restrictionInfo.locations) {
+                                if ($rest.restrictionInfo.locations -contains $Loc) { return $true }
+                            } elseif ($rest.PSObject.Properties['values'] -and $rest.values) {
+                                if ($rest.values -contains $Loc) { return $true }
+                            } elseif ($Filtered) { return $true }
+                        }
+                        return $false
+                    }
 
                     if ($item.Region) {
                         $filter = "location eq '$($item.Region)'"
@@ -673,6 +721,30 @@ if (-not $SkipAvailability) {
                     # or the requested set (collapsed mode).
                     $targets = if ($item.Region) { @($item.Region) } else { $reqRegs }
 
+                    # Region-level tally over ALL VM sizes (not just the requested ones):
+                    # a region where nearly every size is Location-restricted is closed to
+                    # the subscription as a whole. Evaluated after the run.
+                    $tally = @{}
+                    foreach ($tg in $targets) { $tally[$tg] = @{ Total = 0; Blocked = 0 } }
+                    foreach ($s in $allItems) {
+                        if ($s.resourceType -ne 'virtualMachines') { continue }
+                        if ($item.Region) {
+                            $t = $tally[$item.Region]
+                            $t.Total++
+                            if (Test-RegionBlocked $s $item.Region $true) { $t.Blocked++ }
+                        } elseif ($s.locationInfo) {
+                            foreach ($x in $s.locationInfo) {
+                                if (-not $x.location -or -not $tally.ContainsKey($x.location)) { continue }
+                                $t = $tally[$x.location]
+                                $t.Total++
+                                if (Test-RegionBlocked $s $x.location $false) { $t.Blocked++ }
+                            }
+                        }
+                    }
+                    foreach ($tg in $tally.Keys) {
+                        $tallyBag.Add(@{ SubId = $item.SubId; Region = $tg; Total = $tally[$tg].Total; Blocked = $tally[$tg].Blocked })
+                    }
+
                     foreach ($s in $allItems) {
                         if ($s.resourceType -ne 'virtualMachines') { continue }
                         if (-not $skuSet.Contains($s.name))        { continue }
@@ -738,6 +810,7 @@ if (-not $SkipAvailability) {
                             $restrictedZones = @($restrictedZones | Sort-Object -Unique)
                             $bag.Add(@{
                                 Key             = "$($item.SubId)|$tRegion|$($s.name)"
+                                Family          = $(if ($s.PSObject.Properties['family'] -and $s.family) { [string]$s.family } else { '' })
                                 PhysicalZones   = $physicalZones
                                 RegionBlocked   = $regionBlocked
                                 RegionReason    = $regionReason
@@ -756,6 +829,7 @@ if (-not $SkipAvailability) {
 
             foreach ($entry in $availResults) {
                 $availMap[$entry.Key] = @{
+                    Family          = $entry.Family
                     PhysicalZones   = $entry.PhysicalZones
                     RegionBlocked   = $entry.RegionBlocked
                     RegionReason    = $entry.RegionReason
@@ -763,6 +837,7 @@ if (-not $SkipAvailability) {
                     ZoneReason      = $entry.ZoneReason
                 }
             }
+            foreach ($t in $regionTally) { $regionTotals["$($t.SubId)|$($t.Region)"] = $t }
 
             # Surface lookup failures from the main thread so the reconnect hint
             # fires only on the first 401. Every failed pair is recorded so its
@@ -790,6 +865,126 @@ if (-not $SkipAvailability) {
     } catch {
         Write-Warning "SKU availability unavailable - $($_.Exception.Message)"
         Write-Warning "Install Az.Accounts and run Connect-AzAccount to enable, or pass -SkipAvailability to silence."
+    }
+}
+
+# ----- Restricted-access region check --------------------------------------
+# A region where nearly every VM size is Location-restricted is closed to the
+# subscription, but that alone doesn't say why: an ordinary region can be fully
+# blocked by an offer or capacity limit. Restricted-access regions (e.g. DR
+# regions such as switzerlandwest) are told apart by the subscription's
+# Microsoft.Compute provider location list, which omits any such region the
+# subscription hasn't been granted. Only suspect subscription/region pairs cost
+# extra calls (one locations call plus one provider call per suspect
+# subscription), so a normal run makes none. Failures here are never fatal.
+$restrictedPairs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+if ($availAvailable -and $regionTotals.Count -gt 0) {
+    try {
+        $suspects = [System.Collections.Generic.List[hashtable]]::new()
+        foreach ($sub in $subs) {
+            if (-not $sub.Id) { continue }
+            foreach ($r in $Region) {
+                $key = "$($sub.Id)|$r"
+                if ($availFailed.Contains($key)) { continue }
+                $t = $regionTotals[$key]
+                if ($t -and ($t.Total -eq 0 -or ($t.Blocked / $t.Total) -ge 0.9)) {
+                    $suspects.Add(@{ SubId = $sub.Id; Region = $r })
+                }
+            }
+        }
+        if ($suspects.Count -gt 0) {
+            $rcToken = Get-ArmAccessToken
+            $rcHdr   = @{ Authorization = "Bearer $rcToken" }
+
+            # Display-name -> ARM-name map and paired regions: global metadata, so
+            # one call (via any suspect subscription) is enough.
+            $locResp = Invoke-RestMethod -Uri "https://management.azure.com/subscriptions/$($suspects[0].SubId)/locations?api-version=2022-12-01" -Headers $rcHdr -Method Get -ErrorAction Stop
+            $nameByDisplay = @{}
+            $pairedOf      = @{}
+            foreach ($l in $locResp.value) {
+                if ($l.displayName -and $l.name) { $nameByDisplay[[string]$l.displayName] = [string]$l.name }
+                if ($l.PSObject.Properties['metadata'] -and $l.metadata -and $l.metadata.PSObject.Properties['pairedRegion'] -and $l.metadata.pairedRegion) {
+                    $pairedOf[[string]$l.name] = [string]@($l.metadata.pairedRegion)[0].name
+                }
+            }
+
+            $rcResults = [System.Collections.Concurrent.ConcurrentBag[hashtable]]::new()
+            @($suspects | ForEach-Object { $_.SubId } | Select-Object -Unique) | ForEach-Object -Parallel {
+                $sid     = $_
+                $bag     = $using:rcResults
+                $dmap    = $using:nameByDisplay
+                $uri     = "https://management.azure.com/subscriptions/$sid/providers/Microsoft.Compute?api-version=2021-04-01"
+                $headers = @{ Authorization = "Bearer $($using:rcToken)" }
+                $attempt = 0
+                try {
+                    while ($true) {
+                        try {
+                            $resp = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
+                            break
+                        } catch {
+                            $st = 0; $retryAfter = 0
+                            if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
+                                $rsp = $_.Exception.Response
+                                try { $st = [int]$rsp.StatusCode } catch { $st = 0 }
+                                try {
+                                    if ($rsp.Headers -and $rsp.Headers.RetryAfter -and $rsp.Headers.RetryAfter.Delta -and $rsp.Headers.RetryAfter.Delta.HasValue) {
+                                        $retryAfter = [int]$rsp.Headers.RetryAfter.Delta.Value.TotalSeconds
+                                    }
+                                } catch { $retryAfter = 0 }
+                            }
+                            if (($st -eq 429 -or $st -eq 503) -and $attempt -lt 6) {
+                                $attempt++
+                                $delay = if ($retryAfter -gt 0) { [double]$retryAfter } else { [Math]::Min([Math]::Pow(2, $attempt), 30) }
+                                Start-Sleep -Seconds ($delay + (Get-Random -Minimum 0 -Maximum 1000) / 1000.0)
+                                continue
+                            }
+                            throw
+                        }
+                    }
+                    $vmType = $resp.resourceTypes | Where-Object { $_.resourceType -eq 'virtualMachines' } | Select-Object -First 1
+                    if ($vmType -and $vmType.locations) {
+                        # Also keep the space-stripped form so an unmapped display name
+                        # can never make a registered region look missing.
+                        $names = [System.Collections.Generic.List[string]]::new()
+                        foreach ($d in $vmType.locations) {
+                            if ($dmap.ContainsKey($d)) { $names.Add($dmap[$d]) }
+                            $names.Add(($d -replace '\s', '').ToLowerInvariant())
+                        }
+                        $bag.Add(@{ SubId = $sid; Registered = $names.ToArray() })
+                    }
+                } catch {
+                    Write-Verbose "Provider location lookup failed for $sid : $($_.Exception.Message)"
+                }
+            } -ThrottleLimit $ThrottleLimit
+
+            $registeredBySub = @{}
+            foreach ($rc in $rcResults) {
+                $registeredBySub[$rc.SubId] = [System.Collections.Generic.HashSet[string]]::new([string[]]$rc.Registered, [System.StringComparer]::OrdinalIgnoreCase)
+            }
+            $closedPairs = [System.Collections.Generic.List[hashtable]]::new()
+            foreach ($sp in $suspects) {
+                $reg = $registeredBySub[$sp.SubId]
+                if ($reg -and -not $reg.Contains($sp.Region)) {
+                    [void]$restrictedPairs.Add("$($sp.SubId)|$($sp.Region)")
+                    $closedPairs.Add($sp)
+                }
+            }
+
+            # One consolidated warning per region (not per subscription).
+            $maxShown = 5
+            foreach ($grp in ($closedPairs | Group-Object { $_.Region })) {
+                $ids    = @($grp.Group | ForEach-Object { $_.SubId })
+                $shown  = ($ids | Select-Object -First $maxShown) -join ', '
+                if ($ids.Count -gt $maxShown) { $shown += ", ... (+$($ids.Count - $maxShown) more)" }
+                $paired = $pairedOf[$grp.Name]
+                $pairedText = if ($paired) { " (paired with '$paired')" } else { '' }
+                Write-Warning ("Region '$($grp.Name)'$pairedText is not enabled for subscription(s): $shown. " +
+                    "This looks like a restricted-access region, reserved for scenarios such as disaster recovery, so every VM size there is blocked until access is granted. " +
+                    "Request access with a support case (Service and subscription limits > Other requests): https://learn.microsoft.com/troubleshoot/azure/general/region-access-request-process")
+            }
+        }
+    } catch {
+        Write-Verbose "Restricted-region check skipped: $($_.Exception.Message)"
     }
 }
 
@@ -906,6 +1101,152 @@ if ($IncludeZoneMapping -and -not $SkipAvailability -and $availAvailable) {
         }
     } catch {
         Write-Warning "Zone mapping unavailable - $($_.Exception.Message)"
+    }
+}
+
+# ----- Compute quota (opt-in) ---------------------------------------------
+# -IncludeQuota adds the vCPU quota used/available for each size's family.
+# Quota is subscription- and region-scoped (Microsoft.Compute usages API, one
+# GET per sub x region) and keyed by the SKU family captured in the availability
+# pass, so only pairs where a requested size is actually offered are queried and
+# only the needed families are kept. Runs only when availability is enabled.
+$quotaMap    = @{}   # "subId|region" -> @{ family = @{ Used; Limit } }
+$quotaFailed = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+if ($IncludeQuota -and -not $SkipAvailability -and $availAvailable) {
+    try {
+        $qFamilies = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $qPairs    = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($k in $availMap.Keys) {
+            $kp = $k.Split('|', 3)
+            # No usages provider exists in a region the subscription isn't enabled for.
+            if ($restrictedPairs.Contains("$($kp[0])|$($kp[1])")) { continue }
+            [void]$qPairs.Add("$($kp[0])|$($kp[1])")
+            $fam = $availMap[$k].Family
+            if ($fam) { [void]$qFamilies.Add($fam) }
+        }
+        $qWork = @(foreach ($pair in $qPairs) {
+            $pp = $pair.Split('|', 2)
+            @{ SubId = $pp[0]; Region = $pp[1] }
+        })
+        if ($qWork.Count -gt 0) {
+            $qToken         = Get-ArmAccessToken
+            $qTokenAcquired = [datetime]::UtcNow
+            Write-Progress -Activity 'Compute quota lookup' -Status "$($qWork.Count) subscription/region pair(s)..."
+            $qResults  = [System.Collections.Concurrent.ConcurrentBag[hashtable]]::new()
+            $qFailures = [System.Collections.Concurrent.ConcurrentBag[hashtable]]::new()
+
+            # Chunk so the ARM token can be refreshed between waves on long runs.
+            $chunkSize = [Math]::Max($ThrottleLimit * 20, 250)
+            $done      = 0
+            for ($i = 0; $i -lt $qWork.Count; $i += $chunkSize) {
+                if (([datetime]::UtcNow - $qTokenAcquired).TotalMinutes -ge 40) {
+                    try { $qToken = Get-ArmAccessToken; $qTokenAcquired = [datetime]::UtcNow }
+                    catch { Write-Warning "ARM token refresh failed; continuing with the existing token: $($_.Exception.Message)" }
+                }
+                $end   = [Math]::Min($i + $chunkSize - 1, $qWork.Count - 1)
+                $chunk = @($qWork[$i..$end])
+
+                $chunk | ForEach-Object -Parallel {
+                    $item    = $_
+                    $token   = $using:qToken
+                    $bag     = $using:qResults
+                    $failBag = $using:qFailures
+                    $famSet  = $using:qFamilies
+                    $uri     = "https://management.azure.com/subscriptions/$($item.SubId)/providers/Microsoft.Compute/locations/$([Uri]::EscapeDataString($item.Region))/usages?api-version=2024-07-01"
+                    $headers = @{ Authorization = "Bearer $token" }
+                    $maxRetries = 6
+                    $fams       = @{}
+                    try {
+                        do {
+                            $resp    = $null
+                            $attempt = 0
+                            while ($true) {
+                                try {
+                                    $resp = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
+                                    break
+                                } catch {
+                                    # Retry ARM throttling (429) and transient 503s with
+                                    # exponential backoff + jitter, honoring Retry-After.
+                                    $st = 0; $retryAfter = 0
+                                    if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
+                                        $r = $_.Exception.Response
+                                        try { $st = [int]$r.StatusCode } catch { $st = 0 }
+                                        try {
+                                            if ($r.Headers -and $r.Headers.RetryAfter -and $r.Headers.RetryAfter.Delta -and $r.Headers.RetryAfter.Delta.HasValue) {
+                                                $retryAfter = [int]$r.Headers.RetryAfter.Delta.Value.TotalSeconds
+                                            }
+                                        } catch { $retryAfter = 0 }
+                                    }
+                                    if (($st -eq 429 -or $st -eq 503) -and $attempt -lt $maxRetries) {
+                                        $attempt++
+                                        $delay = if ($retryAfter -gt 0) { [double]$retryAfter } else { [Math]::Min([Math]::Pow(2, $attempt), 30) }
+                                        $delay += (Get-Random -Minimum 0 -Maximum 1000) / 1000.0
+                                        Start-Sleep -Seconds $delay
+                                        continue
+                                    }
+                                    throw
+                                }
+                            }
+                            foreach ($u in $resp.value) {
+                                if ($u.name -and $u.name.value -and $famSet.Contains($u.name.value)) {
+                                    $fams[[string]$u.name.value] = @{ Used = [int]$u.currentValue; Limit = [int64]$u.limit }
+                                }
+                            }
+                            $uri = if ($resp.PSObject.Properties['nextLink'] -and $resp.nextLink) { $resp.nextLink } else { $null }
+                        } while ($uri)
+                        $bag.Add(@{ SubId = $item.SubId; Region = $item.Region; Families = $fams })
+                    } catch {
+                        $status = 0
+                        if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
+                            try { $status = [int]$_.Exception.Response.StatusCode } catch { $status = 0 }
+                        }
+                        # The response body carries the service error code (e.g.
+                        # NoRegisteredProviderFound), far more useful than 'Bad Request'.
+                        $code = ''
+                        try {
+                            if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $code = [string]($_.ErrorDetails.Message | ConvertFrom-Json).error.code }
+                        } catch { $code = '' }
+                        $failBag.Add(@{ SubId = $item.SubId; Region = $item.Region; Status = $status; Code = $code; Message = $_.Exception.Message })
+                    }
+                } -ThrottleLimit $ThrottleLimit
+
+                $done += $chunk.Count
+                Write-Progress -Activity 'Compute quota lookup' `
+                    -Status "$done / $($qWork.Count) processed" `
+                    -PercentComplete ([Math]::Min(100, [int](100 * $done / $qWork.Count)))
+            }
+
+            foreach ($r in $qResults) { $quotaMap["$($r.SubId)|$($r.Region)"] = $r.Families }
+
+            # Summarize failures from the main thread (one line per category, not per
+            # pair) so the reconnect hint fires only on the first 401 of the run.
+            if ($qFailures.Count -gt 0) {
+                foreach ($f in $qFailures) { [void]$quotaFailed.Add("$($f.SubId)|$($f.Region)") }
+                $q401   = @($qFailures | Where-Object { $_.Status -eq 401 })
+                $qOther = @($qFailures | Where-Object { $_.Status -ne 401 })
+                if ($q401.Count -gt 0) {
+                    if (-not $reconnectHintShown) {
+                        Write-Warning "Quota lookup returned 401 Unauthorized for $($q401.Count) subscription/region pair(s). Your Azure token may be stale - run Connect-AzAccount to refresh, then retry."
+                        $reconnectHintShown = $true
+                    } else {
+                        Write-Warning "Quota lookup returned 401 Unauthorized for $($q401.Count) subscription/region pair(s) - your account is not authorized for this scope; skipping."
+                    }
+                }
+                if ($qOther.Count -gt 0) {
+                    # Group by error so a restricted region reads as one line, not one per sub.
+                    $qMax = 5
+                    foreach ($grp in ($qOther | Group-Object { if ($_.Code) { $_.Code } else { "HTTP $($_.Status)" } })) {
+                        $regs = @($grp.Group | ForEach-Object { $_.Region } | Sort-Object -Unique)
+                        $shown = ($regs | Select-Object -First $qMax) -join ', '
+                        if ($regs.Count -gt $qMax) { $shown += ", ... (+$($regs.Count - $qMax) more)" }
+                        Write-Warning "Quota lookup failed ($($grp.Name)) for $($grp.Count) subscription/region pair(s) in: $shown. Their rows show '?' for quota."
+                    }
+                }
+            }
+            Write-Progress -Activity 'Compute quota lookup' -Completed
+        }
+    } catch {
+        Write-Warning "Quota unavailable - $($_.Exception.Message)"
     }
 }
 
@@ -1072,6 +1413,10 @@ $Region | ForEach-Object -Parallel {
     $zoneMap      = $using:zoneMap
     $zoneSubsOk   = $using:zoneSubsOk
     $includeZoneMap = $using:IncludeZoneMapping
+    $quotaMap     = $using:quotaMap
+    $quotaFailedSet = $using:quotaFailed
+    $restrictedSet = $using:restrictedPairs
+    $includeQuota = $using:IncludeQuota
     $subs         = $using:subs
     $rowsBag      = $using:rows
     $currency     = $using:Currency
@@ -1217,6 +1562,7 @@ $Region | ForEach-Object -Parallel {
         $zoneAvail     = '?'
         $restriction   = '?'
         $regionBlocked = $false
+        $info          = $null
         if ($availOn -and $sub.Id) {
           if ($availFailedSet.Contains("$($sub.Id)|$region")) {
             # The availability lookup for this subscription/region failed (e.g.
@@ -1270,6 +1616,26 @@ $Region | ForEach-Object -Parallel {
             }
         }
 
+        # vCPU quota for the size's family in this (sub, region). 'N/A' when the size
+        # isn't offered here or the region isn't enabled for the subscription (no
+        # quota applies); '?' when unknown (availability or quota lookup failed, or
+        # the family wasn't reported).
+        $quotaUsed  = '?'
+        $quotaAvail = '?'
+        $pairKey    = "$($sub.Id)|$region"
+        if ($includeQuota -and $availOn -and $sub.Id -and -not $availFailedSet.Contains($pairKey)) {
+            if (-not $info -or $restrictedSet.Contains($pairKey)) {
+                $quotaUsed  = 'N/A'
+                $quotaAvail = 'N/A'
+            } elseif (-not $quotaFailedSet.Contains($pairKey)) {
+                $q = $quotaMap[$pairKey]
+                if ($q -and $info.Family -and $q.ContainsKey($info.Family)) {
+                    $quotaUsed  = $q[$info.Family].Used
+                    $quotaAvail = [Math]::Max(0, $q[$info.Family].Limit - $q[$info.Family].Used)
+                }
+            }
+        }
+
         $rowsBag.Add([pscustomobject]@{
             SubscriptionName = $sub.Name
             SubscriptionId   = $sub.Id
@@ -1279,6 +1645,8 @@ $Region | ForEach-Object -Parallel {
             ZoneAvailability   = $zoneAvail
             Restrictions       = $restriction
             ZoneMapping        = $zoneMapping
+            QuotaUsed          = $quotaUsed
+            QuotaAvailable     = $quotaAvail
             RegionBlocked      = $regionBlocked
             OS              = $os
             PAYGO_PerMonth  = if ($null -ne $payMo)  { [Math]::Round($payMo, 2) }  else { $null }
@@ -1450,6 +1818,7 @@ $csvProps += 'Region', 'VmSize'
 if (-not $SkipAvailability) {
     $csvProps += 'RegionAvailability', 'ZoneAvailability', 'Restrictions'
     if ($IncludeZoneMapping) { $csvProps += 'ZoneMapping' }
+    if ($IncludeQuota)       { $csvProps += 'QuotaUsed', 'QuotaAvailable' }
 }
 if (-not $SkipPricing) {
     if ($IncludeWindows) { $csvProps += 'OS' }
@@ -1488,6 +1857,10 @@ if ($sorted.Count -eq 0) {
         # Region is already its own column, so the physical zone is the short id (az1).
         if ($IncludeZoneMapping) {
             $cols += @{n='ZoneMapping'; e={ $_.ZoneMapping }}
+        }
+        if ($IncludeQuota) {
+            $cols += @{n='QuotaUsed';      e={ $_.QuotaUsed }}
+            $cols += @{n='QuotaAvailable'; e={ $_.QuotaAvailable }}
         }
     }
     if (-not $SkipPricing) {
@@ -1535,9 +1908,9 @@ if ($sorted.Count -eq 0) {
     }
 
     $sep = '  '
-    # Numeric columns (monthly costs and saving percentages) are right-aligned
-    # so decimal points line up; text columns stay left-aligned.
-    $isNumeric = { param($h) $h -match '/Mo|%$' }
+    # Numeric columns (monthly costs, saving percentages, quota counts) are
+    # right-aligned so digits line up; text columns stay left-aligned.
+    $isNumeric = { param($h) $h -match '/Mo|%$|^Quota' }
     $headerLine = ($headers | ForEach-Object {
         if (& $isNumeric $_) { $_.PadLeft($widths[$_]) } else { $_.PadRight($widths[$_]) }
     }) -join $sep
@@ -1545,11 +1918,17 @@ if ($sorted.Count -eq 0) {
         $dash = '-' * $_.Length
         if (& $isNumeric $_) { $dash.PadLeft($widths[$_]) } else { $dash.PadRight($widths[$_]) }
     }) -join $sep
-    if ($IncludeZoneMapping -and -not $SkipAvailability) {
+    $showZoneNote  = $IncludeZoneMapping -and -not $SkipAvailability
+    $showQuotaNote = $IncludeQuota -and -not $SkipAvailability
+    if ($showZoneNote) {
         Write-Host '  NOTE: ZoneMapping is logical=physical zone (e.g. 1=az2). Logical zone numbers are' -ForegroundColor Yellow
         Write-Host '        randomized per subscription, so compare across subscriptions by physical zone (az).' -ForegroundColor Yellow
-        Write-Host ''
     }
+    if ($showQuotaNote) {
+        Write-Host "  NOTE: QuotaUsed / QuotaAvailable are vCPUs in the VM size's family quota for that region" -ForegroundColor Yellow
+        Write-Host '        and subscription (available = limit - used). Regional total vCPU quota also applies.' -ForegroundColor Yellow
+    }
+    if ($showZoneNote -or $showQuotaNote) { Write-Host '' }
     Write-Host $headerLine
     Write-Host $underline
     foreach ($row in $sorted) {

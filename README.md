@@ -17,6 +17,7 @@ one or more subscriptions, regions, and VM sizes.
 | Zone availability | Zones the SKU is offered in (e.g. `1,2,3`), `N/A` (non-zonal), or `Unavailable` (not listed) | `Microsoft.Compute/skus` (ARM) |
 | Restrictions | Region/zone restriction detail (`Region` and/or `Zone 1,2,3`) — the size is offered but blocked for your subscription; needs a support case | `Microsoft.Compute/skus` (ARM) |
 | Logical→physical zone mapping | Which physical zone (e.g. `az1`) each logical zone maps to — opt-in via `-IncludeZoneMapping` | `Microsoft.Resources` locations API |
+| Compute quota | vCPU quota used and still available for the VM size's family in each region — opt-in via `-IncludeQuota` | `Microsoft.Compute` usages API |
 | PAYGO | Pay-as-you-go monthly compute cost | Azure Retail Prices API |
 | Spot | Current published Spot monthly rate + saving vs PAYGO | Azure Retail Prices API |
 | Reserved Instance | 1-year and 3-year monthly cost + saving vs PAYGO | Azure Retail Prices API |
@@ -54,6 +55,24 @@ These two concepts are reported separately and mean different things:
   is *offered* to you — it does not guarantee underlying capacity (a region/zone and VM combination
   may still be out of capacity at allocation time).
 
+### Restricted-access regions
+
+Some regions (for example disaster-recovery regions such as `switzerlandwest`,
+`germanynorth`, `norwaywest` or `brazilsoutheast`) are reserved for specific
+scenarios and must be requested per subscription. Without access, every VM size
+there shows a `Region` restriction, which looks the same as an ordinary region
+that is blocked for your subscription by an offer or capacity limit — but the fix
+is different.
+
+When every VM size in a region is blocked, the script checks the subscription's
+`Microsoft.Compute` provider locations. If the region isn't enabled there, it
+prints **one warning per region** naming the paired region and pointing to the
+[region access request process](https://learn.microsoft.com/troubleshoot/azure/general/region-access-request-process)
+(a support case under *Service and subscription limits (quotas)* › *Other
+requests*). A region that is merely blocked but still enabled gets no such
+warning. Rows keep their normal `Region` restriction; `QuotaUsed` /
+`QuotaAvailable` show `N/A`.
+
 ## Requirements
 
 - **PowerShell 7.0** or later
@@ -78,7 +97,7 @@ CSV); all other parameters are optional.
 ```powershell
 .\Get-ComputeAvailability.ps1 -VmSize <string[]> -Region <string[]> `
     [-VmSizeCsv <string>] [-RegionCsv <string>] [-SubscriptionIdCsv <string>] `
-    [-IncludeSpot] [-IncludeWindows] [-IncludeZoneMapping] [-HoursPerMonth <int>] [-ACD <double>] `
+    [-IncludeSpot] [-IncludeWindows] [-IncludeZoneMapping] [-IncludeQuota] [-HoursPerMonth <int>] [-ACD <double>] `
     [-InstanceCount <int>] [-Currency <string>] [-OutputCsv <string>] [-PassThru] `
     [-SkipAvailability] [-SkipPricing] [-SubscriptionId <string[]>] [-ThrottleLimit <int>]
 ```
@@ -94,6 +113,7 @@ CSV); all other parameters are optional.
 | `-IncludeSpot` | `switch` | Include Spot pricing. Spot is highly variable; the API returns the current published rate at query time. |
 | `-IncludeWindows` | `switch` | Add Windows-licensed rows alongside Linux. Windows rows bundle the Windows Server license premium — not discounted by RI/SP (it bills at PAYGO), though `-ACD` still applies. |
 | `-IncludeZoneMapping` | `switch` | Add a `ZoneMapping` column showing which physical zone (e.g. `az1`) each logical zone maps to. Logical zone numbers are randomized per subscription, so the physical zone makes zone availability comparable across subscriptions. One `GET` per subscription (all regions) via the `Microsoft.Resources` locations API. Requires availability; ignored with `-SkipAvailability`. |
+| `-IncludeQuota` | `switch` | Add `QuotaUsed` and `QuotaAvailable` columns: the vCPU quota used and still available (limit − used) for each VM size's family, per region and subscription. One `GET` per subscription × region where a requested size is offered, via the `Microsoft.Compute` usages API. Family vCPU quota only — see [Notes & caveats](#notes--caveats). Requires availability; ignored with `-SkipAvailability`. |
 | `-HoursPerMonth` | `int` | Hours used to project hourly rates into monthly costs. Default `730` (Azure billing convention: 365.25 × 24 / 12). |
 | `-ACD` | `double` | All-up customer discount percentage (0–100) applied to the PAYGO rate to reflect EA/MCA negotiated pricing. Applies to the entire PAYGO rate, including the Windows license premium. RI/SP compute rates are unchanged, but because the Windows license bills at PAYGO, ACD discounts it there too; Save% is recalculated against the discounted baseline. Default `0`. **Note:** this is a single flat discount applied uniformly — it does not model SKU-level or product-specific negotiated discounts (see [Notes & caveats](#notes--caveats)). |
 | `-InstanceCount` | `int` | Multiply all monthly cost columns by this count to project an N-instance deployment. Save% is unaffected. Default `1`. |
@@ -120,6 +140,9 @@ CSV); all other parameters are optional.
 
 # Show which physical zone each logical zone maps to (comparable across subscriptions)
 .\Get-ComputeAvailability.ps1 -Region eastus,westus2 -VmSize Standard_D2s_v5 -SkipPricing -IncludeZoneMapping
+
+# Check used and available vCPU quota for each VM size's family
+.\Get-ComputeAvailability.ps1 -Region eastus,westus2 -VmSize Standard_D4s_v5,Standard_E8s_v5 -SkipPricing -IncludeQuota
 
 # Apply a negotiated 15% discount and project a 10-instance deployment
 .\Get-ComputeAvailability.ps1 -Region eastus -VmSize Standard_D8s_v5 -ACD 15 -InstanceCount 10
@@ -174,6 +197,7 @@ One row per subscription × region × VM size (× OS when `-IncludeWindows` is s
 | `ZoneAvailability` | Zones the SKU is offered in for the region (e.g. `1,2,3`). `N/A` for a non-zonal region, `Unavailable` when the SKU is not listed, or `?`. |
 | `Restrictions` | `None`, the restriction detail (`Region` for a subscription-level block and/or `Zone 1,2,3` for blocked zones), `VM size not available in region.` when the SKU is not listed, or `Availability lookup failed.` when the per-subscription/region lookup errored (shown as `?` rather than a false negative). A restriction means the size is offered but blocked for your subscription; unblock via a support case. `?` when the lookup is unavailable. |
 | `ZoneMapping` | Logical → physical zone map for the region, shown as `logical=physical` (e.g. `1=az2; 2=az1; 3=az3`), only with `-IncludeZoneMapping`. A note printed above the table explains the format. Since logical zone numbers are randomized per subscription, the physical zone (`az1`) is what makes zones comparable across subscriptions. The zone id is short (`az1`) because the region is already its own column. `N/A` for a non-zonal region, `?` when the mapping lookup was skipped or failed. |
+| `QuotaUsed` / `QuotaAvailable` | vCPUs used and still available (limit − used, never below 0) in the VM size's family quota for that region and subscription, only with `-IncludeQuota`. A note printed above the table explains the format. `N/A` when the size isn't offered in the region or the region isn't enabled for the subscription (see [Restricted-access regions](#restricted-access-regions)), `?` when the quota lookup was skipped or failed. |
 | `PAYGO/Mo` | Pay-as-you-go monthly cost. Header shows `(-N%)` when `-ACD` is applied. |
 | `Spot/Mo` / `Spot%` | Spot monthly cost and saving vs PAYGO (with `-IncludeSpot`). |
 | `RI1Yr/Mo` / `RI1Yr%` | Reserved Instance 1-year monthly cost and saving. |
@@ -215,6 +239,18 @@ run-context fields (`Currency`, `SpotIncluded`, `WindowsLicenseIncluded`,
 - **Logical→physical zone mapping** (with `-IncludeZoneMapping`) is fetched once
   per subscription from the `Microsoft.Resources` locations API, reusing the same
   bearer token, chunked token refresh, and 429/503 backoff as the availability pass.
+- **Compute quota** (with `-IncludeQuota`) is keyed by the VM size's SKU family,
+  which is captured during the availability pass. Only subscription/region pairs
+  where a requested size is offered are queried (one `GET` each), and the same
+  token refresh and 429/503 backoff apply. Because the usages API has no
+  all-regions form, the call count grows with subscriptions × regions.
+- **Restricted-access regions** are detected from data the availability pass
+  already downloaded: it tallies, per subscription and region, how many of *all*
+  VM sizes (not just the requested ones) are `Location`-restricted. Only regions
+  where nearly every size is blocked trigger a follow-up, and only for those
+  subscriptions: one locations call (for display names and paired regions) plus
+  one `Microsoft.Compute` provider call per suspect subscription, with the same
+  429/503 backoff. A normal run makes no extra calls. This check is never fatal.
 - **One combined Retail API request per region** fetches both Consumption
   (PAYGO/Spot/Savings Plan) and Reservation records, halving API calls.
 - **Region names are validated** against `Get-AzLocation` before querying, and
@@ -252,6 +288,12 @@ run-context fields (`Currency`, `SpotIncluded`, `WindowsLicenseIncluded`,
 - **Azure Hybrid Benefit (AHB)** users should ignore Windows rows and use the
   Linux rows which exclude licensing costs.
 - Spot rates fluctuate; the reported value is a point-in-time snapshot.
+- **Quota (`-IncludeQuota`) is the on-demand family vCPU quota only.** A
+  deployment must also fit within the **regional total vCPU** quota (and Spot
+  vCPU quota for Spot VMs), which are separate limits not shown here, so
+  `QuotaAvailable` can overstate what you can actually deploy. It also reflects
+  your quota, not physical capacity — see
+  [Availability vs. restrictions](#availability-vs-restrictions).
 - Availability and restrictions are **subscription-scoped**. Pass one or more
   `-SubscriptionId` to evaluate specific subscriptions; when omitted the
   current Az context is used. Unresolvable IDs are warned and skipped, and if
