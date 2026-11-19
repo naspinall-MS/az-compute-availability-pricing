@@ -36,16 +36,22 @@
         still available (limit - used) in the VM size's family quota for that
         region and subscription. A note above the table explains the format.
         'N/A' when the size isn't offered in the region or the region isn't
-        enabled for the subscription, '?' when the quota lookup was skipped
-        or failed.
+        enabled for the subscription, 'NotRegistered' / 'Registering' when the
+        subscription's Microsoft.Compute provider is confirmed to be the reason
+        there is no quota data (it is reported once, with the fix), '?' when the
+        quota lookup was skipped or failed for any other reason.
 
     Restricted-access regions (e.g. disaster-recovery regions such as
     switzerlandwest) must be requested per subscription. When every VM size in
     a region is blocked, the script checks the subscription's Microsoft.Compute
-    provider locations; if the region isn't among them it warns once per region
-    (naming the paired region) and points to the region access request process,
-    rather than leaving only a per-size 'Region' restriction. This costs extra
-    calls only for suspect subscriptions, so a normal run makes none.
+    provider locations; if the region isn't among them it warns once (naming the
+    regions and their paired regions) and points to the region access request
+    process, rather than leaving only a per-size 'Region' restriction. This costs
+    extra calls only for suspect subscriptions, so a normal run makes none.
+
+    Messages stay bounded however many inputs there are: subscriptions are only
+    counted, lists of regions and VM sizes show the first few then '(+N more)',
+    and repeated failures collapse into one line per cause.
 
     Compute has BOTH commitment-discount mechanisms (unlike storage):
       - Reserved Instances (RI):  SKU-locked, 1-year or 3-year terms.
@@ -411,6 +417,15 @@ function Test-RetailRegionHasVm {
     }
 }
 
+function Get-LimitedList {
+    # Joins values for a message, showing at most $Max and summarizing the rest so long inputs can't flood the output.
+    param([object[]]$Values, [int]$Max = 5)
+    $v    = @($Values)
+    $text = ($v | Select-Object -First $Max) -join ', '
+    if ($v.Count -gt $Max) { $text += ", ... (+$($v.Count - $Max) more)" }
+    $text
+}
+
 function Get-ArmAccessToken {
     # Returns a plain-string ARM bearer token, handling both the SecureString
     # (Az.Accounts >= 2.20) and legacy plain-string shapes. Interactive user
@@ -460,6 +475,7 @@ if ($SubscriptionId.Count -gt 0 -and -not $SkipAvailability) {
     if (-not $azAvailable) {
         Write-Warning "-SubscriptionId specified but Az module not available. Install Az.Accounts and Connect-AzAccount."
     } else {
+        $unresolvedCount = 0
         foreach ($id in $SubscriptionId) {
             if ($subs | Where-Object { $_.Id -eq $id }) { continue }   # skip duplicate ids
             $resolved = $null
@@ -468,8 +484,12 @@ if ($SubscriptionId.Count -gt 0 -and -not $SkipAvailability) {
             if ($resolved) {
                 $subs.Add(@{ Name = $resolved.Name; Id = $resolved.Id })
             } else {
-                Write-Warning "Subscription not found / not accessible: $id"
+                $unresolvedCount++
+                Write-Verbose "Subscription not found / not accessible: $id"
             }
+        }
+        if ($unresolvedCount -gt 0) {
+            Write-Warning "$unresolvedCount of $($SubscriptionId.Count) subscription ID(s) not found or not accessible and skipped (run with -Verbose to list them)."
         }
     }
 }
@@ -479,7 +499,7 @@ if ($subs.Count -eq 0) {
     # fall back to the current context, which would attribute subscription-scoped
     # availability data to the wrong subscription. Fail loudly instead.
     if ($SubscriptionId.Count -gt 0 -and -not $SkipAvailability) {
-        throw "None of the specified subscription IDs could be resolved or accessed: $($SubscriptionId -join ', '). Check the IDs and your Az login (Connect-AzAccount)."
+        throw "None of the $($SubscriptionId.Count) specified subscription ID(s) could be resolved or accessed. Check the IDs and your Az login (Connect-AzAccount); run with -Verbose for details."
     }
     # No -SubscriptionId specified: fall back to current context, or a single
     # empty placeholder (so pricing-only runs still produce rows).
@@ -526,7 +546,7 @@ if ($azAvailable -and ($subs[0].Id -ne '')) {
 
         $invalidRegions = @($Region | Where-Object { -not $canonMap.ContainsKey($_) })
         if ($invalidRegions) {
-            Write-Warning "Invalid Azure region name(s) - removed from query: $($invalidRegions -join ', ')"
+            Write-Warning "Invalid Azure region name(s) - removed from query: $(Get-LimitedList $invalidRegions)"
         }
         # Normalize survivors to canonical (ARM API filter is case-sensitive)
         $Region = @($Region |
@@ -844,19 +864,24 @@ if (-not $SkipAvailability) {
             # rows render '?' rather than a false 'Unavailable'.
             foreach ($f in $availFailures) { [void]$availFailed.Add("$($f.SubId)|$($f.Region)") }
             if ($availFailures.Count -gt 0) {
+                # One line per cause, not per subscription/region pair.
                 $auth401 = @($availFailures | Where-Object { $_.Status -eq 401 })
                 $other   = @($availFailures | Where-Object { $_.Status -ne 401 })
-                foreach ($f in $auth401) {
-                    $scope = "sub: $($f.SubName), region: $($f.Region)"
+                if ($auth401.Count -gt 0) {
+                    $n401Subs = @($auth401 | ForEach-Object { $_.SubId } | Sort-Object -Unique).Count
+                    $scope    = "$($auth401.Count) subscription/region pair(s) across $n401Subs subscription(s)"
                     if (-not $reconnectHintShown) {
-                        Write-Warning "Availability lookup returned 401 Unauthorized ($scope). Your Azure token may be stale - run Connect-AzAccount to refresh, then retry."
+                        Write-Warning "Availability lookup returned 401 Unauthorized for $scope. Your Azure token may be stale - run Connect-AzAccount to refresh, then retry."
                         $reconnectHintShown = $true
                     } else {
-                        Write-Warning "Availability lookup returned 401 Unauthorized ($scope) - your account is not authorized for this scope; skipping."
+                        Write-Warning "Availability lookup returned 401 Unauthorized for $scope - your account is not authorized for this scope; skipping."
                     }
                 }
-                foreach ($f in $other) {
-                    Write-Warning "Availability lookup failed (sub: $($f.SubName), region: $($f.Region)): $($f.Message)"
+                foreach ($grp in ($other | Group-Object { if ($_.Status) { "HTTP $($_.Status)" } else { $_.Message } })) {
+                    $regs = @($grp.Group | ForEach-Object { $_.Region } | Sort-Object -Unique)
+                    $sample = [string]$grp.Group[0].Message
+                    if ($sample.Length -gt 150) { $sample = $sample.Substring(0, 150) + '...' }
+                    Write-Warning "Availability lookup failed for $($grp.Count) subscription/region pair(s) in: $(Get-LimitedList $regs). Their rows show '?'. Error: $sample"
                 }
             }
             Write-Progress -Activity 'SKU availability lookup' -Completed
@@ -970,16 +995,18 @@ if ($availAvailable -and $regionTotals.Count -gt 0) {
                 }
             }
 
-            # One consolidated warning per region (not per subscription).
-            $maxShown = 5
-            foreach ($grp in ($closedPairs | Group-Object { $_.Region })) {
-                $ids    = @($grp.Group | ForEach-Object { $_.SubId })
-                $shown  = ($ids | Select-Object -First $maxShown) -join ', '
-                if ($ids.Count -gt $maxShown) { $shown += ", ... (+$($ids.Count - $maxShown) more)" }
-                $paired = $pairedOf[$grp.Name]
-                $pairedText = if ($paired) { " (paired with '$paired')" } else { '' }
-                Write-Warning ("Region '$($grp.Name)'$pairedText is not enabled for subscription(s): $shown. " +
-                    "This looks like a restricted-access region, reserved for scenarios such as disaster recovery, so every VM size there is blocked until access is granted. " +
+            # One consolidated warning for the whole run: regions are capped and
+            # subscriptions are only counted, so neither list can flood the output.
+            if ($closedPairs.Count -gt 0) {
+                $closedRegions = @($closedPairs | ForEach-Object { $_.Region } | Sort-Object -Unique)
+                $closedSubs    = @($closedPairs | ForEach-Object { $_.SubId } | Sort-Object -Unique).Count
+                $regionText    = Get-LimitedList @($closedRegions | ForEach-Object {
+                    if ($pairedOf[$_]) { "$_ (paired with $($pairedOf[$_]))" } else { $_ }
+                })
+                $totalSubs  = @($subs | Where-Object { $_.Id }).Count
+                $subsText   = if ($totalSubs -le 1) { 'the subscription' } else { "$closedSubs of $totalSubs subscriptions" }
+                Write-Warning ("Restricted-access region(s) not enabled for ${subsText}: $regionText. " +
+                    "These are reserved for scenarios such as disaster recovery, so every VM size there is blocked until access is granted. " +
                     "Request access with a support case (Service and subscription limits > Other requests): https://learn.microsoft.com/troubleshoot/azure/general/region-access-request-process")
             }
         }
@@ -1112,6 +1139,10 @@ if ($IncludeZoneMapping -and -not $SkipAvailability -and $availAvailable) {
 # only the needed families are kept. Runs only when availability is enabled.
 $quotaMap    = @{}   # "subId|region" -> @{ family = @{ Used; Limit } }
 $quotaFailed = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+# subId -> 'NotRegistered' | 'Registering' for subscriptions whose empty usage data was traced to the provider.
+$quotaProviderState = @{}
+# Printed below the run-summary banner so they read as results, not setup noise.
+$quotaWarnings = [System.Collections.Generic.List[string]]::new()
 if ($IncludeQuota -and -not $SkipAvailability -and $availAvailable) {
     try {
         $qFamilies = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -1156,6 +1187,7 @@ if ($IncludeQuota -and -not $SkipAvailability -and $availAvailable) {
                     $headers = @{ Authorization = "Bearer $token" }
                     $maxRetries = 6
                     $fams       = @{}
+                    $seen       = 0
                     try {
                         do {
                             $resp    = $null
@@ -1188,13 +1220,20 @@ if ($IncludeQuota -and -not $SkipAvailability -and $availAvailable) {
                                 }
                             }
                             foreach ($u in $resp.value) {
+                                $seen++
                                 if ($u.name -and $u.name.value -and $famSet.Contains($u.name.value)) {
                                     $fams[[string]$u.name.value] = @{ Used = [int]$u.currentValue; Limit = [int64]$u.limit }
                                 }
                             }
                             $uri = if ($resp.PSObject.Properties['nextLink'] -and $resp.nextLink) { $resp.nextLink } else { $null }
                         } while ($uri)
-                        $bag.Add(@{ SubId = $item.SubId; Region = $item.Region; Families = $fams })
+                        if ($seen -eq 0) {
+                            # A success with zero entries is what an unregistered Microsoft.Compute
+                            # provider returns; without this the rows would show '?' silently.
+                            $failBag.Add(@{ SubId = $item.SubId; Region = $item.Region; Status = 0; Code = 'NoUsageData'; Message = 'The usages API returned no entries.' })
+                        } else {
+                            $bag.Add(@{ SubId = $item.SubId; Region = $item.Region; Families = $fams })
+                        }
                     } catch {
                         $status = 0
                         if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
@@ -1223,30 +1262,94 @@ if ($IncludeQuota -and -not $SkipAvailability -and $availAvailable) {
             if ($qFailures.Count -gt 0) {
                 foreach ($f in $qFailures) { [void]$quotaFailed.Add("$($f.SubId)|$($f.Region)") }
                 $q401   = @($qFailures | Where-Object { $_.Status -eq 401 })
-                $qOther = @($qFailures | Where-Object { $_.Status -ne 401 })
+                $qEmpty = @($qFailures | Where-Object { $_.Code -eq 'NoUsageData' })
+                $qOther = @($qFailures | Where-Object { $_.Status -ne 401 -and $_.Code -ne 'NoUsageData' })
+                if ($qEmpty.Count -gt 0) {
+                    # Subscription-level cause. An empty usages list is what an unregistered
+                    # Microsoft.Compute provider returns, but confirm it from the registration
+                    # state rather than assume, so the cells only claim what is known.
+                    $emptySubs = @($qEmpty | ForEach-Object { $_.SubId } | Sort-Object -Unique)
+                    try {
+                        $psToken   = Get-ArmAccessToken
+                        $psResults = [System.Collections.Concurrent.ConcurrentBag[hashtable]]::new()
+                        $emptySubs | ForEach-Object -Parallel {
+                            $sid     = $_
+                            $bag     = $using:psResults
+                            $uri     = "https://management.azure.com/subscriptions/$sid/providers/Microsoft.Compute?api-version=2021-04-01"
+                            $headers = @{ Authorization = "Bearer $($using:psToken)" }
+                            $attempt = 0
+                            try {
+                                while ($true) {
+                                    try {
+                                        $resp = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
+                                        break
+                                    } catch {
+                                        $st = 0; $retryAfter = 0
+                                        if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
+                                            $rsp = $_.Exception.Response
+                                            try { $st = [int]$rsp.StatusCode } catch { $st = 0 }
+                                            try {
+                                                if ($rsp.Headers -and $rsp.Headers.RetryAfter -and $rsp.Headers.RetryAfter.Delta -and $rsp.Headers.RetryAfter.Delta.HasValue) {
+                                                    $retryAfter = [int]$rsp.Headers.RetryAfter.Delta.Value.TotalSeconds
+                                                }
+                                            } catch { $retryAfter = 0 }
+                                        }
+                                        if (($st -eq 429 -or $st -eq 503) -and $attempt -lt 6) {
+                                            $attempt++
+                                            $delay = if ($retryAfter -gt 0) { [double]$retryAfter } else { [Math]::Min([Math]::Pow(2, $attempt), 30) }
+                                            Start-Sleep -Seconds ($delay + (Get-Random -Minimum 0 -Maximum 1000) / 1000.0)
+                                            continue
+                                        }
+                                        throw
+                                    }
+                                }
+                                $bag.Add(@{ SubId = $sid; State = [string]$resp.registrationState })
+                            } catch {
+                                Write-Verbose "Provider registration lookup failed for $sid : $($_.Exception.Message)"
+                            }
+                        } -ThrottleLimit $ThrottleLimit
+                        foreach ($ps in $psResults) {
+                            switch ($ps.State) {
+                                { $_ -in 'NotRegistered', 'Unregistered', 'Unregistering' } { $quotaProviderState[$ps.SubId] = 'NotRegistered' }
+                                'Registering' { $quotaProviderState[$ps.SubId] = 'Registering' }
+                            }
+                        }
+                    } catch {
+                        Write-Verbose "Provider registration check skipped: $($_.Exception.Message)"
+                    }
+                    $nNotReg      = @($emptySubs | Where-Object { $quotaProviderState[$_] -eq 'NotRegistered' }).Count
+                    $nRegistering = @($emptySubs | Where-Object { $quotaProviderState[$_] -eq 'Registering' }).Count
+                    $nUnknown     = $emptySubs.Count - $nNotReg - $nRegistering
+                    if ($nNotReg -gt 0) {
+                        $quotaWarnings.Add("Microsoft.Compute isn't registered on $nNotReg subscription(s), so quota is unavailable there (rows show 'NotRegistered'). Register it with: Register-AzResourceProvider -ProviderNamespace Microsoft.Compute")
+                    }
+                    if ($nRegistering -gt 0) {
+                        $quotaWarnings.Add("Microsoft.Compute is still registering on $nRegistering subscription(s) (rows show 'Registering'); run again shortly.")
+                    }
+                    if ($nUnknown -gt 0) {
+                        $quotaWarnings.Add("Quota lookup returned no usage data for $nUnknown subscription(s) and the cause couldn't be confirmed (rows show '?').")
+                    }
+                }
                 if ($q401.Count -gt 0) {
                     if (-not $reconnectHintShown) {
-                        Write-Warning "Quota lookup returned 401 Unauthorized for $($q401.Count) subscription/region pair(s). Your Azure token may be stale - run Connect-AzAccount to refresh, then retry."
+                        $quotaWarnings.Add("Quota lookup returned 401 Unauthorized for $($q401.Count) subscription/region pair(s). Your Azure token may be stale - run Connect-AzAccount to refresh, then retry.")
                         $reconnectHintShown = $true
                     } else {
-                        Write-Warning "Quota lookup returned 401 Unauthorized for $($q401.Count) subscription/region pair(s) - your account is not authorized for this scope; skipping."
+                        $quotaWarnings.Add("Quota lookup returned 401 Unauthorized for $($q401.Count) subscription/region pair(s) - your account is not authorized for this scope; skipping.")
                     }
                 }
                 if ($qOther.Count -gt 0) {
                     # Group by error so a restricted region reads as one line, not one per sub.
-                    $qMax = 5
                     foreach ($grp in ($qOther | Group-Object { if ($_.Code) { $_.Code } else { "HTTP $($_.Status)" } })) {
                         $regs = @($grp.Group | ForEach-Object { $_.Region } | Sort-Object -Unique)
-                        $shown = ($regs | Select-Object -First $qMax) -join ', '
-                        if ($regs.Count -gt $qMax) { $shown += ", ... (+$($regs.Count - $qMax) more)" }
-                        Write-Warning "Quota lookup failed ($($grp.Name)) for $($grp.Count) subscription/region pair(s) in: $shown. Their rows show '?' for quota."
+                        $quotaWarnings.Add("Quota lookup failed ($($grp.Name)) for $($grp.Count) subscription/region pair(s) in: $(Get-LimitedList $regs). Their rows show '?' for quota.")
                     }
                 }
             }
             Write-Progress -Activity 'Compute quota lookup' -Completed
         }
     } catch {
-        Write-Warning "Quota unavailable - $($_.Exception.Message)"
+        $quotaWarnings.Add("Quota unavailable - $($_.Exception.Message)")
     }
 }
 
@@ -1394,8 +1497,11 @@ if (-not $SkipPricing) {
 }
 Write-Host '================================================================' -ForegroundColor Cyan
 Write-Host ''
+foreach ($qw in $quotaWarnings) { Write-Warning $qw }
+if ($quotaWarnings.Count -gt 0) { Write-Host '' }
 
 # ---------------------------------------------------------------------------
+$priceFailures = [System.Collections.Concurrent.ConcurrentBag[hashtable]]::new()
 Write-Progress -Activity 'Querying regions' -Status "$($Region.Count) region(s)..."
 
 $Region | ForEach-Object -Parallel {
@@ -1415,11 +1521,13 @@ $Region | ForEach-Object -Parallel {
     $includeZoneMap = $using:IncludeZoneMapping
     $quotaMap     = $using:quotaMap
     $quotaFailedSet = $using:quotaFailed
+    $quotaProvState = $using:quotaProviderState
     $restrictedSet = $using:restrictedPairs
     $includeQuota = $using:IncludeQuota
     $subs         = $using:subs
     $rowsBag      = $using:rows
     $currency     = $using:Currency
+    $priceFailBag = $using:priceFailures
 
     function Invoke-PricingPages {
         param([string]$Filter)
@@ -1450,7 +1558,7 @@ $Region | ForEach-Object -Parallel {
 
         $items = @()
         try { $items = Invoke-PricingPages -Filter $combinedFilter }
-        catch { Write-Warning "[$region] price query failed: $($_.Exception.Message)" ; return }
+        catch { $priceFailBag.Add(@{ Region = $region; Message = $_.Exception.Message }); return }
 
         # Split locally by priceType
         $consumptionItems = $items | Where-Object { $_.type -eq 'Consumption' }
@@ -1618,8 +1726,10 @@ $Region | ForEach-Object -Parallel {
 
         # vCPU quota for the size's family in this (sub, region). 'N/A' when the size
         # isn't offered here or the region isn't enabled for the subscription (no
-        # quota applies); '?' when unknown (availability or quota lookup failed, or
-        # the family wasn't reported).
+        # quota applies); 'NotRegistered' / 'Registering' when the subscription's
+        # Microsoft.Compute provider is known to be the reason there is no quota data;
+        # '?' when unknown (availability or quota lookup failed, or the family wasn't
+        # reported).
         $quotaUsed  = '?'
         $quotaAvail = '?'
         $pairKey    = "$($sub.Id)|$region"
@@ -1633,6 +1743,9 @@ $Region | ForEach-Object -Parallel {
                     $quotaUsed  = $q[$info.Family].Used
                     $quotaAvail = [Math]::Max(0, $q[$info.Family].Limit - $q[$info.Family].Used)
                 }
+            } elseif ($quotaProvState.ContainsKey($sub.Id)) {
+                $quotaUsed  = $quotaProvState[$sub.Id]
+                $quotaAvail = $quotaProvState[$sub.Id]
             }
         }
 
@@ -1668,6 +1781,11 @@ $Region | ForEach-Object -Parallel {
 
 Write-Progress -Activity 'Querying regions' -Completed
 
+# One warning per distinct error, naming a capped list of regions.
+foreach ($grp in ($priceFailures | Group-Object { $_['Message'] })) {
+    $failedRegions = @($grp.Group | ForEach-Object { $_['Region'] } | Sort-Object -Unique)
+    Write-Warning "Price query failed for $($failedRegions.Count) region(s) ($(Get-LimitedList $failedRegions)): $($grp.Name)"
+}
 # ----- Post-run diagnostics: region + VM size coverage ---------------------
 # Index what actually came back so we can explain any gaps precisely.
 $regionsWithData = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -1694,7 +1812,7 @@ if ($regionsValidated) {
     $noDataRegions = @($Region | Where-Object { -not $regionsWithData.Contains($_) })
     $badRegions    = @($noDataRegions | Where-Object { -not (Test-RetailRegionHasVm -Region $_ -Currency $Currency) })
     if ($badRegions) {
-        Write-Warning "Unknown or invalid region name(s): $($badRegions -join ', ')"
+        Write-Warning "Unknown or invalid region name(s): $(Get-LimitedList $badRegions)"
     }
 }
 
@@ -1740,6 +1858,12 @@ $existsGlobally = if ($noDataSkus.Count -gt 0 -and -not $SkipPricing) {
 }
 
 $unknownSkus = [System.Collections.Generic.List[string]]::new()
+# One bounded warning per cause (below), not one per VM size.
+$diagPending   = [System.Collections.Generic.List[string]]::new()
+$diagNotHere   = [System.Collections.Generic.List[string]]::new()
+$diagNotPriced = [System.Collections.Generic.List[string]]::new()
+$diagNoAvail   = [System.Collections.Generic.List[string]]::new()
+$diagGap       = [System.Collections.Generic.List[string]]::new()
 foreach ($s in $VmSize) {
     if (-not $skuMissingIn.ContainsKey($s)) { continue }   # present in every queried region
     $missing = $skuMissingIn[$s]
@@ -1752,28 +1876,45 @@ foreach ($s in $VmSize) {
         } else { @() }
 
         if ($availHere.Count -gt 0) {
-            Write-Warning "VM size '$s' is available in region(s): $($availHere -join ', ') but has no published pricing yet - likely a new/preview SKU whose meters have not propagated to the Retail API."
+            $diagPending.Add($s)
         } elseif ($existsGlobally.Contains($s)) {
-            Write-Warning "VM size '$s' is a valid Azure size but is not offered in the selected region(s): $($missing -join ', '). Pick a region where it is available."
+            $diagNotHere.Add($s)
         } elseif ($availSkuRegions.ContainsKey($s)) {
             # ARM knows the size but not in the specific queried regions - still real, not a typo.
-            Write-Warning "VM size '$s' is a valid Azure size but is not offered / priced in the selected region(s): $($missing -join ', ')."
+            $diagNotPriced.Add($s)
         } elseif (-not $SkipPricing) {
-            Write-Warning "Unknown VM size (not found in the Azure retail catalog): $s - check for typos (e.g. Standard_D2s_v5)."
             $unknownSkus.Add($s)
         } else {
-            Write-Warning "VM size '$s' returned no availability data in the selected region(s): $($missing -join ', ')."
+            $diagNoAvail.Add($s)
         }
     } else {
         # Present in some regions, missing in others: a regional availability gap.
-        Write-Warning "VM size '$s' not offered in region(s): $($missing -join ', ')"
+        $diagGap.Add("$s (missing: $(Get-LimitedList $missing -Max 3))")
     }
+}
+if ($diagPending.Count -gt 0) {
+    Write-Warning "VM size(s) available but with no published pricing yet (likely new/preview SKUs whose meters haven't propagated to the Retail API): $(Get-LimitedList $diagPending)"
+}
+if ($diagNotHere.Count -gt 0) {
+    Write-Warning "VM size(s) are valid Azure sizes but not offered in any of the selected regions - pick a region where they are available: $(Get-LimitedList $diagNotHere)"
+}
+if ($diagNotPriced.Count -gt 0) {
+    Write-Warning "VM size(s) are valid Azure sizes but not offered / priced in any of the selected regions: $(Get-LimitedList $diagNotPriced)"
+}
+if ($unknownSkus.Count -gt 0) {
+    Write-Warning "Unknown VM size(s) (not found in the Azure retail catalog) - check for typos (e.g. Standard_D2s_v5): $(Get-LimitedList $unknownSkus)"
+}
+if ($diagNoAvail.Count -gt 0) {
+    Write-Warning "VM size(s) returned no availability data in the selected regions: $(Get-LimitedList $diagNoAvail)"
+}
+if ($diagGap.Count -gt 0) {
+    Write-Warning "VM size(s) not offered in some of the selected regions: $(Get-LimitedList $diagGap)"
 }
 
 # Mirror the all-regions-invalid behavior: if EVERY requested VM size is an
 # unknown name, stop hard rather than exiting quietly with an empty table.
 if ($queryRegions.Count -gt 0 -and $VmSize.Count -gt 0 -and $unknownSkus.Count -eq $VmSize.Count) {
-    throw "None of the specified VM sizes are valid Azure VM size names: $($unknownSkus -join ', '). Check for typos (e.g. Standard_D2s_v5)."
+    throw "None of the specified VM sizes are valid Azure VM size names: $(Get-LimitedList $unknownSkus). Check for typos (e.g. Standard_D2s_v5)."
 }
 
 # Commitment-pricing gaps: for each SKU present in the results, identify which
@@ -1790,14 +1931,20 @@ if (-not $SkipPricing) {
         @{ Name = 'SP 3Yr'; Prop = 'SP_3Yr_PerMonth' }
     )
     $rowsBySku = $rows | Group-Object VmSize
+    $commitGaps = @{}   # "RI 1Yr, RI 3Yr" -> sizes missing exactly those commitments
     foreach ($g in $rowsBySku) {
         $missingTypes = foreach ($chk in $commitmentChecks) {
             $hasAny = $g.Group | Where-Object { $null -ne $_.($chk.Prop) }
             if (-not $hasAny) { $chk.Name }
         }
         if ($missingTypes) {
-            Write-Warning "No commitment pricing published for $($g.Name): $($missingTypes -join ', ')"
+            $gapKey = $missingTypes -join ', '
+            if (-not $commitGaps.ContainsKey($gapKey)) { $commitGaps[$gapKey] = [System.Collections.Generic.List[string]]::new() }
+            $commitGaps[$gapKey].Add($g.Name)
         }
+    }
+    foreach ($gapKey in ($commitGaps.Keys | Sort-Object)) {
+        Write-Warning "No commitment pricing published for $(Get-LimitedList $commitGaps[$gapKey]): $gapKey"
     }
 }
 

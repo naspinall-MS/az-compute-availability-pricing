@@ -66,12 +66,21 @@ is different.
 
 When every VM size in a region is blocked, the script checks the subscription's
 `Microsoft.Compute` provider locations. If the region isn't enabled there, it
-prints **one warning per region** naming the paired region and pointing to the
+prints **one warning** (covering all such regions) naming each region's paired
+region and pointing to the
 [region access request process](https://learn.microsoft.com/troubleshoot/azure/general/region-access-request-process)
 (a support case under *Service and subscription limits (quotas)* › *Other
 requests*). A region that is merely blocked but still enabled gets no such
 warning. Rows keep their normal `Region` restriction; `QuotaUsed` /
 `QuotaAvailable` show `N/A`.
+
+### Message volume
+
+Warnings stay readable however large the run is. Subscriptions are only
+*counted* (never listed; use `-Verbose` for per-ID detail), lists of regions and
+VM sizes show the first five followed by `(+N more)`, and repeated failures are
+collapsed into one line per cause instead of one per subscription, region or
+size.
 
 ## Requirements
 
@@ -197,7 +206,7 @@ One row per subscription × region × VM size (× OS when `-IncludeWindows` is s
 | `ZoneAvailability` | Zones the SKU is offered in for the region (e.g. `1,2,3`). `N/A` for a non-zonal region, `Unavailable` when the SKU is not listed, or `?`. |
 | `Restrictions` | `None`, the restriction detail (`Region` for a subscription-level block and/or `Zone 1,2,3` for blocked zones), `VM size not available in region.` when the SKU is not listed, or `Availability lookup failed.` when the per-subscription/region lookup errored (shown as `?` rather than a false negative). A restriction means the size is offered but blocked for your subscription; unblock via a support case. `?` when the lookup is unavailable. |
 | `ZoneMapping` | Logical → physical zone map for the region, shown as `logical=physical` (e.g. `1=az2; 2=az1; 3=az3`), only with `-IncludeZoneMapping`. A note printed above the table explains the format. Since logical zone numbers are randomized per subscription, the physical zone (`az1`) is what makes zones comparable across subscriptions. The zone id is short (`az1`) because the region is already its own column. `N/A` for a non-zonal region, `?` when the mapping lookup was skipped or failed. |
-| `QuotaUsed` / `QuotaAvailable` | vCPUs used and still available (limit − used, never below 0) in the VM size's family quota for that region and subscription, only with `-IncludeQuota`. A note printed above the table explains the format. `N/A` when the size isn't offered in the region or the region isn't enabled for the subscription (see [Restricted-access regions](#restricted-access-regions)), `?` when the quota lookup was skipped or failed. |
+| `QuotaUsed` / `QuotaAvailable` | vCPUs used and still available (limit − used, never below 0) in the VM size's family quota for that region and subscription, only with `-IncludeQuota`. A note printed above the table explains the format. `N/A` when the size isn't offered in the region or the region isn't enabled for the subscription (see [Restricted-access regions](#restricted-access-regions)), `NotRegistered` / `Registering` when the subscription's `Microsoft.Compute` resource provider is confirmed as the reason there is no quota data (the script reports it once, with the `Register-AzResourceProvider` fix), `?` when the quota lookup was skipped or failed for any other reason. |
 | `PAYGO/Mo` | Pay-as-you-go monthly cost. Header shows `(-N%)` when `-ACD` is applied. |
 | `Spot/Mo` / `Spot%` | Spot monthly cost and saving vs PAYGO (with `-IncludeSpot`). |
 | `RI1Yr/Mo` / `RI1Yr%` | Reserved Instance 1-year monthly cost and saving. |
